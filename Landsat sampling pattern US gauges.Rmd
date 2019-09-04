@@ -1,0 +1,373 @@
+---
+title: "Landsat_sampling_pattern"
+author: "Xiao Yang"
+date: "8/21/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(sf)
+```
+
+## import daily discharge data
+
+```{r}
+dat_dir = "data/Master_Tables"
+files = dir(dat_dir, pattern = "*.csv", full.names = T)
+
+code = read_csv(files[1]) %>% 
+  mutate(index = 1:nrow(.)) %>% 
+  gather(key = "site_id", value = "code", -index)
+date = read_csv(files[2]) %>% 
+  mutate(index = 1:nrow(.)) %>% 
+  gather(key = "site_id", value = "date", -index) %>% 
+  mutate(date = as.Date(date / 3600 / 24, origin = "1970-01-01"))
+value = read_csv(files[3]) %>% 
+  mutate(index = 1:nrow(.)) %>% 
+  gather(key = "site_id", value = "discharge", -index)
+
+dat_full_discharge = code %>% 
+  inner_join(date) %>% 
+  inner_join(value) %>% 
+  filter(!is.na(date) & !is.na(discharge))
+
+dat_full_discharge = dat_full_discharge %>% 
+  select(-index) %>%
+  filter(discharge > 0)
+
+save(dat_full_discharge, file = "outputs/dat_full_discharge.RData")
+
+# daily_gauge_discharge_fig = dat_full_discharge %>%
+#   ggplot() +
+#   geom_density(aes(discharge, fill = "Daily gauge discharge"), alpha = 0.7) +
+#   scale_x_log10() +
+#   labs(
+#     x = "Discharge",
+#     y = "Density",
+#     fill = "Dataset"
+#   )
+```
+
+## import discharge data overlapping with Landsat
+
+```{r}
+require(foreach)
+sensor_names = c("Landsat_5", "Landsat_7", "Landsat_8")
+
+ls_dates = foreach(i = sensor_names, .combine = "bind_rows") %do% {
+  
+  dat_dir = paste0("data/", i)
+  file_fulldates = dir(paste0(dat_dir, "/AllReturns"), pattern = "DischargeDates.*.csv", full.names = T)
+  file_cleardates = dir(paste0(dat_dir, "/CloudsRemoved"), pattern = "DischargeDates.*.csv", full.names = T)
+  
+  fulldates = read_csv(file_fulldates) %>% 
+    gather(key = "site_id", value = "date") %>% 
+    mutate(date = as.Date(date / 3600 / 24, origin = "1970-01-01")) %>% 
+    distinct() ## noticed a lot of duplicates, could come from tile overlapping
+  
+  cleardates = read_csv(file_cleardates) %>% 
+    gather(key = "site_id", value = "date") %>% 
+    mutate(date = as.Date(date / 3600 / 24, origin = "1970-01-01"),
+           cloud_free = T) %>% 
+    distinct()
+  
+  fulldates %>% 
+    left_join(cleardates, by = c("site_id", "date")) %>% 
+    mutate(satellite = i)
+}
+
+ls_dates = ls_dates %>% 
+  filter(!is.na(date)) %>% 
+  mutate(satellite = as.factor(satellite))
+
+save(ls_dates, file = "outputs/dat_landsat.RData")
+```
+
+## merge the gauge data with landsat dates
+
+```{r}
+merged = dat_full_discharge %>% 
+  mutate(site_id = paste0("X", site_id)) %>% 
+  left_join(ls_dates, by = c("site_id", "date"))
+
+merged = merged %>% 
+  separate(site_id, into = c("X", "site_id"), sep = "X", remove = T, convert = T) %>%
+  mutate(site_id = sprintf("%08d", site_id)) %>% 
+  select(-X)
+
+save(merged, file = "outputs/merged_gauge_landsat_dates.RData")
+```
+
+## test on one site
+
+```{r}
+ks_stats = function(x, y) {
+  temp = ks.test(x, y)
+  return(tibble(D = temp$statistic, pvalue = temp$p.value))
+}
+
+this_site_id = "01010000"
+
+q_site = merged %>% 
+  filter(site_id == this_site_id)
+
+q_site_ls = q_site %>% 
+  filter(!is.na(satellite))
+
+datemin = q_site_ls$date %>% min()
+datemax = q_site_ls$date %>% max()
+
+end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1]
+
+calc_quantiles = function(x, probs = seq(0, 1, by = 0.01)) {
+  result = x %>% 
+    do({
+    dat = .
+    tibble(probs = probs, 
+           q_all = quantile(x = dat %>% pull(discharge), probs = probs),
+           q_ls_all = quantile(x = dat %>% filter(!is.na(satellite)) %>% pull(discharge), probs = probs),
+           q_ls_cfree = quantile(x = dat %>% filter(!is.na(satellite), cloud_free == T) %>% pull(discharge), probs = probs),
+           site_id = dat$site_id[1])
+  })
+}
+
+q_site %>% 
+  do({
+    calc_quantiles(.)
+  }) %>% 
+  ggplot() +
+  geom_abline(aes(slope = 1, intercept = 0)) +
+  geom_point(aes(x = q_all, y = q_ls_all, color = "ls_all")) +
+  geom_point(aes(x = q_all, y = q_ls_cfree, color = "ls_cfree")) +
+  scale_x_log10() +
+  scale_y_log10()
+  
+
+test = foreach(d = 1:length(end_dates), .combine = "bind_rows") %do% {
+  
+  q_site_ls_fil = q_site_ls %>% filter(date <= end_dates[d])
+  
+  temp = ks_stats(x = q_site$discharge, 
+                  y = q_site_ls_fil %>% pull(discharge)) %>% 
+    rename(D_all = D,
+           pvalue_all = pvalue) %>% 
+    bind_cols(
+      ks_stats(x = q_site$discharge, 
+               y = q_site_ls_fil %>% filter(cloud_free == T) %>% pull(discharge)) %>% 
+        rename(D_cfree = D,
+               pvalue_cfree = pvalue)) %>% 
+    mutate(end_date = end_dates[d])
+  
+  probs = seq(0, 1, by = 0.01)
+  fig = calc_quantiles(q_site_ls_fil) %>% 
+    mutate(q_all = quantile(q_site$discharge, probs = probs)) %>% 
+    ggplot() +
+    geom_abline(aes(slope = 1, intercept = 0)) +
+    geom_point(aes(x = q_all, y = q_ls_all, color = "ls_all"), alpha = 0.7) +
+    geom_point(aes(x = q_all, y = q_ls_cfree, color = "ls_cfree"), alpha = 0.7) +
+    scale_x_log10(limits = c(min(q_site$discharge), max(q_site$discharge))) +
+    scale_y_log10(limits = c(min(q_site$discharge), max(q_site$discharge))) +
+    labs(x = "Quantile (all discharge data)",
+         y = "Quantile (Landsat observed)",
+         color = "Cloud filter")
+  
+  temp %>% mutate(fig = list(fig))
+}
+
+
+for (i in 1:nrow(test)) {
+  this_row = test[i, ]
+  
+  figure = this_row$fig[[1]] +
+    labs(
+      title = paste0(this_site_id, ". Years of Landsat data: ", i),
+      subtitle = paste0(
+        "D_all (k-s): ", format(this_row$D_all, digits = 3), "; p: ", format(this_row$pvalue_all, digits = 2), "\n",
+        "D_cfree (k-s): ", format(this_row$D_cfree, digits = 3), "; p: ", format(this_row$pvalue_cfree, digits = 2))
+      )
+  
+  figure %>% 
+    ggsave(
+      filename = paste0("figs/X1010000/", sprintf("%03d", i), ".png"),
+      width = 6,
+      height = 6
+    )
+}
+
+# q_site %>% 
+#   ggplot() +
+#   geom_density(aes(x = discharge, color = "all_q")) +
+#   geom_density(data = . %>% filter(!is.na(satellite)), aes(x = discharge, color = "all_landsat")) +
+#   geom_density(data = . %>% filter(!is.na(satellite), cloud_free == T), aes(x = discharge, color = "all_cloudfree_landsat")) +
+#   scale_x_log10()
+```
+
+## test on one site with permutation on the starting date
+
+```{r}
+calc_temporal_permutations = function(min_start_date, max_start_date, seed = 2019, N = 100) {
+  set.seed(seed)
+  
+  return(tibble(possible_start_dates = seq.Date(from = min_start_date, to = max_start_date, by = 1)) %>% 
+    sample_n(N) %>% 
+      pull(possible_start_dates))
+}
+
+ks_stats = function(x, y) {
+  temp = ks.test(x, y)
+  return(tibble(D = temp$statistic, pvalue = temp$p.value))
+}
+
+calc_quantiles = function(x, probs = seq(0, 1, by = 0.01)) {
+  result = x %>% 
+    do({
+    dat = .
+    tibble(probs = probs, 
+           q_all = quantile(x = dat %>% pull(discharge), probs = probs),
+           q_ls_all = quantile(x = dat %>% filter(!is.na(satellite)) %>% pull(discharge), probs = probs),
+           q_ls_cfree = quantile(x = dat %>% filter(!is.na(satellite), cloud_free == T) %>% pull(discharge), probs = probs),
+           site_id = dat$site_id[1])
+  })
+}
+
+this_site_id = "02236125"
+
+q_site = merged %>% 
+  filter(site_id == this_site_id)
+
+q_site_ls = q_site %>% 
+  filter(!is.na(satellite))
+
+datemin = q_site_ls$date %>% min()
+datemax = q_site_ls$date %>% max()
+
+end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1]
+
+min_start_date = datemin
+max_start_date = datemax - 15 * 365
+potential_start_date = calc_temporal_permutations(min_start_date, max_start_date)
+max_years_ls = 15  
+
+test_ensemble = foreach(s = 1:length(potential_start_date), .combine = "bind_rows") %do% {
+  
+  foreach(n = 1:max_years_ls, .combine = "bind_rows") %do% {
+    q_site_ls_fil = q_site_ls %>% 
+    filter(date >= potential_start_date[s],
+           date <= potential_start_date[s] + n * 365)
+    
+    if (nrow(q_site_ls_fil %>% filter(cloud_free == T)) == 0) { ## when there is no cloud free image in the date range, assign NA to D and pvalue.
+      temp = ks_stats(x = q_site$discharge, 
+                      y = q_site_ls_fil %>% pull(discharge)) %>% 
+        rename(D_all = D,
+               pvalue_all = pvalue) %>% 
+        bind_cols(tibble(D_cfree = NA,
+                         pvalue_cfree = NA))
+    } else {
+      temp = ks_stats(x = q_site$discharge, 
+                      y = q_site_ls_fil %>% pull(discharge)) %>% 
+        rename(D_all = D,
+               pvalue_all = pvalue) %>% 
+        bind_cols(
+          ks_stats(x = q_site$discharge, 
+                   y = q_site_ls_fil %>% filter(cloud_free == T) %>% pull(discharge)) %>% 
+            rename(D_cfree = D,
+                   pvalue_cfree = pvalue))
+    }
+    
+    temp %>% 
+      mutate(nyears = n, 
+             start_date = potential_start_date[s],
+             end_date = potential_start_date[s] + n * 365)
+  }
+    
+}
+
+D_fig = test_ensemble %>% 
+  select(D_all, nyears, D_cfree, start_date) %>% 
+  gather(key = "source",
+         value = "D",
+         -c(nyears, start_date)) %>% 
+  mutate(nyears = as.factor(nyears)) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = nyears, y = D, fill = source), alpha = 0.4, show.legend = F) +
+  labs(
+    x = "No. of years of Landsat data",
+    y = "D",
+    title = this_site_id
+  )
+
+D_fig
+
+D_fig %>% 
+  ggsave(
+    filename = paste0("figs/", this_site_id, "_D.png"),
+    width = 5,
+    height = 4)
+
+pvalue_fig = test_ensemble %>% 
+  select(pvalue_all, nyears, pvalue_cfree, start_date) %>% 
+  gather(key = "source",
+         value = "pvalue",
+         -c(nyears, start_date)) %>% 
+  mutate(nyears = as.factor(nyears)) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = nyears, y = pvalue, fill = source), alpha = 0.4) +
+  labs(
+    fill = "Landsat sampling",
+    x = "No. of years of Landsat data",
+    y = "p-value",
+    title = this_site_id
+  ) +
+  theme(legend.direction = "horizontal",
+        legend.position = "bottom")
+
+pvalue_fig
+
+pvalue_fig %>% 
+  ggsave(
+    filename = paste0("figs/", this_site_id, "_pvalue.png"),
+    width = 5,
+    height = 4)
+```
+
+## map the gauge stations
+
+```{r}
+site_stats = merged %>% 
+  group_by(site_id) %>% 
+  do({
+    dat = .
+    dat_ls = dat %>% filter(!is.na(satellite))
+    dat_ls_cf = dat_ls %>% filter(cloud_free == T)
+    
+    ls_ls_all = ks_stats(dat$discharge, dat_ls$discharge) %>% 
+      mutate(source = "ls_all")
+    ls_ls_cf = ks_stats(dat$discharge, dat_ls_cf$discharge) %>% 
+      mutate(source = "ls_cfree")
+    bind_rows(ls_ls_all, ls_ls_cf)
+  }) %>% 
+  ungroup()
+
+site_stats = site_stats %>% 
+  separate(site_id, into = c("X", "site_id"), sep = "X", remove = T, convert = T) %>%
+  mutate(site_id = sprintf("%08d", site_id)) %>% 
+  select(-X)
+
+site_info = read_csv(file = "data/SiteAttributes.csv") %>% 
+  mutate(site_id = sprintf("%08d", site_no)) %>% 
+  select(lon = dec_long_va, 
+         lat = dec_lat_va,
+         site_id) %>% 
+  distinct()
+
+site_stats_sf = site_stats %>% 
+  inner_join(site_info %>% st_as_sf(coords = c("lon", "lat"), crs = 4326), by = "site_id") %>% 
+  st_as_sf()
+
+require(mapview)
+mapview::mapView(site_stats_sf %>% filter(source == "ls_cfree", site_id == "02236125"))
+```
+
