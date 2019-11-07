@@ -10,364 +10,1265 @@ knitr::opts_chunk$set(echo = TRUE)
 
 require(tidyverse)
 require(sf)
-```
-
-## import daily discharge data
-
-```{r}
-dat_dir = "data/Master_Tables"
-files = dir(dat_dir, pattern = "*.csv", full.names = T)
-
-code = read_csv(files[1]) %>% 
-  mutate(index = 1:nrow(.)) %>% 
-  gather(key = "site_id", value = "code", -index)
-date = read_csv(files[2]) %>% 
-  mutate(index = 1:nrow(.)) %>% 
-  gather(key = "site_id", value = "date", -index) %>% 
-  mutate(date = as.Date(date / 3600 / 24, origin = "1970-01-01"))
-value = read_csv(files[3]) %>% 
-  mutate(index = 1:nrow(.)) %>% 
-  gather(key = "site_id", value = "discharge", -index)
-
-dat_full_discharge = code %>% 
-  inner_join(date) %>% 
-  inner_join(value) %>% 
-  filter(!is.na(date) & !is.na(discharge))
-
-dat_full_discharge = dat_full_discharge %>% 
-  select(-index) %>%
-  filter(discharge > 0)
-
-save(dat_full_discharge, file = "outputs/dat_full_discharge.RData")
-
-# daily_gauge_discharge_fig = dat_full_discharge %>%
-#   ggplot() +
-#   geom_density(aes(discharge, fill = "Daily gauge discharge"), alpha = 0.7) +
-#   scale_x_log10() +
-#   labs(
-#     x = "Discharge",
-#     y = "Density",
-#     fill = "Dataset"
-#   )
-```
-
-## import discharge data overlapping with Landsat
-
-```{r}
 require(foreach)
-sensor_names = c("Landsat_5", "Landsat_7", "Landsat_8")
 
-ls_dates = foreach(i = sensor_names, .combine = "bind_rows") %do% {
-  
-  dat_dir = paste0("data/", i)
-  file_fulldates = dir(paste0(dat_dir, "/AllReturns"), pattern = "DischargeDates.*.csv", full.names = T)
-  file_cleardates = dir(paste0(dat_dir, "/CloudsRemoved"), pattern = "DischargeDates.*.csv", full.names = T)
-  
-  fulldates = read_csv(file_fulldates) %>% 
-    gather(key = "site_id", value = "date") %>% 
-    mutate(date = as.Date(date / 3600 / 24, origin = "1970-01-01")) %>% 
-    distinct() ## noticed a lot of duplicates, could come from tile overlapping
-  
-  cleardates = read_csv(file_cleardates) %>% 
-    gather(key = "site_id", value = "date") %>% 
-    mutate(date = as.Date(date / 3600 / 24, origin = "1970-01-01"),
-           cloud_free = T) %>% 
-    distinct()
-  
-  fulldates %>% 
-    left_join(cleardates, by = c("site_id", "date")) %>% 
-    mutate(satellite = i)
-}
+load("outputs/dat_full_discharge_cleaned_20191001.RData", verbose = T)
+load("outputs/dat_landsat_discharge_cleaned_20191001.RData", verbose = T)
+load("outputs/site_lonlat_20191001.RData", verbose = T)
 
-ls_dates = ls_dates %>% 
-  filter(!is.na(date)) %>% 
-  mutate(satellite = as.factor(satellite))
+# x = rnorm(n = 10)
+# y = x + 0.1
 
-save(ls_dates, file = "outputs/dat_landsat.RData")
-```
-
-## merge the gauge data with landsat dates
-
-```{r}
-merged = dat_full_discharge %>% 
-  mutate(site_id = paste0("X", site_id)) %>% 
-  left_join(ls_dates, by = c("site_id", "date"))
-
-merged = merged %>% 
-  separate(site_id, into = c("X", "site_id"), sep = "X", remove = T, convert = T) %>%
-  mutate(site_id = sprintf("%08d", site_id)) %>% 
-  select(-X)
-
-save(merged, file = "outputs/merged_gauge_landsat_dates.RData")
-```
-
-## test on one site
-
-```{r}
-ks_stats = function(x, y) {
-  temp = ks.test(x, y)
-  return(tibble(D = temp$statistic, pvalue = temp$p.value))
-}
-
-this_site_id = "01010000"
-
-q_site = merged %>% 
-  filter(site_id == this_site_id)
-
-q_site_ls = q_site %>% 
-  filter(!is.na(satellite))
-
-datemin = q_site_ls$date %>% min()
-datemax = q_site_ls$date %>% max()
-
-end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1]
-
-calc_quantiles = function(x, probs = seq(0, 1, by = 0.01)) {
-  result = x %>% 
-    do({
-    dat = .
-    tibble(probs = probs, 
-           q_all = quantile(x = dat %>% pull(discharge), probs = probs),
-           q_ls_all = quantile(x = dat %>% filter(!is.na(satellite)) %>% pull(discharge), probs = probs),
-           q_ls_cfree = quantile(x = dat %>% filter(!is.na(satellite), cloud_free == T) %>% pull(discharge), probs = probs),
-           site_id = dat$site_id[1])
-  })
-}
-
-q_site %>% 
-  do({
-    calc_quantiles(.)
-  }) %>% 
-  ggplot() +
-  geom_abline(aes(slope = 1, intercept = 0)) +
-  geom_point(aes(x = q_all, y = q_ls_all, color = "ls_all")) +
-  geom_point(aes(x = q_all, y = q_ls_cfree, color = "ls_cfree")) +
-  scale_x_log10() +
-  scale_y_log10()
-  
-
-test = foreach(d = 1:length(end_dates), .combine = "bind_rows") %do% {
-  
-  q_site_ls_fil = q_site_ls %>% filter(date <= end_dates[d])
-  
-  temp = ks_stats(x = q_site$discharge, 
-                  y = q_site_ls_fil %>% pull(discharge)) %>% 
-    rename(D_all = D,
-           pvalue_all = pvalue) %>% 
-    bind_cols(
-      ks_stats(x = q_site$discharge, 
-               y = q_site_ls_fil %>% filter(cloud_free == T) %>% pull(discharge)) %>% 
-        rename(D_cfree = D,
-               pvalue_cfree = pvalue)) %>% 
-    mutate(end_date = end_dates[d])
-  
-  probs = seq(0, 1, by = 0.01)
-  fig = calc_quantiles(q_site_ls_fil) %>% 
-    mutate(q_all = quantile(q_site$discharge, probs = probs)) %>% 
-    ggplot() +
-    geom_abline(aes(slope = 1, intercept = 0)) +
-    geom_point(aes(x = q_all, y = q_ls_all, color = "ls_all"), alpha = 0.7) +
-    geom_point(aes(x = q_all, y = q_ls_cfree, color = "ls_cfree"), alpha = 0.7) +
-    scale_x_log10(limits = c(min(q_site$discharge), max(q_site$discharge))) +
-    scale_y_log10(limits = c(min(q_site$discharge), max(q_site$discharge))) +
-    labs(x = "Quantile (all discharge data)",
-         y = "Quantile (Landsat observed)",
-         color = "Cloud filter")
-  
-  temp %>% mutate(fig = list(fig))
-}
-
-
-for (i in 1:nrow(test)) {
-  this_row = test[i, ]
-  
-  figure = this_row$fig[[1]] +
-    labs(
-      title = paste0(this_site_id, ". Years of Landsat data: ", i),
-      subtitle = paste0(
-        "D_all (k-s): ", format(this_row$D_all, digits = 3), "; p: ", format(this_row$pvalue_all, digits = 2), "\n",
-        "D_cfree (k-s): ", format(this_row$D_cfree, digits = 3), "; p: ", format(this_row$pvalue_cfree, digits = 2))
-      )
-  
-  figure %>% 
-    ggsave(
-      filename = paste0("figs/X1010000/", sprintf("%03d", i), ".png"),
-      width = 6,
-      height = 6
-    )
-}
-
-# q_site %>% 
-#   ggplot() +
-#   geom_density(aes(x = discharge, color = "all_q")) +
-#   geom_density(data = . %>% filter(!is.na(satellite)), aes(x = discharge, color = "all_landsat")) +
-#   geom_density(data = . %>% filter(!is.na(satellite), cloud_free == T), aes(x = discharge, color = "all_cloudfree_landsat")) +
-#   scale_x_log10()
-```
-
-## test on one site with permutation on the starting date
-
-```{r}
-calc_temporal_permutations = function(min_start_date, max_start_date, seed = 2019, N = 100) {
-  set.seed(seed)
-  
-  return(tibble(possible_start_dates = seq.Date(from = min_start_date, to = max_start_date, by = 1)) %>% 
-    sample_n(N) %>% 
-      pull(possible_start_dates))
-}
-
-ks_stats = function(x, y) {
-  temp = ks.test(x, y)
-  return(tibble(D = temp$statistic, pvalue = temp$p.value))
-}
-
-calc_quantiles = function(x, probs = seq(0, 1, by = 0.01)) {
-  result = x %>% 
-    do({
-    dat = .
-    tibble(probs = probs, 
-           q_all = quantile(x = dat %>% pull(discharge), probs = probs),
-           q_ls_all = quantile(x = dat %>% filter(!is.na(satellite)) %>% pull(discharge), probs = probs),
-           q_ls_cfree = quantile(x = dat %>% filter(!is.na(satellite), cloud_free == T) %>% pull(discharge), probs = probs),
-           site_id = dat$site_id[1])
-  })
-}
-
-this_site_id = "02236125"
-
-q_site = merged %>% 
-  filter(site_id == this_site_id)
-
-q_site_ls = q_site %>% 
-  filter(!is.na(satellite))
-
-datemin = q_site_ls$date %>% min()
-datemax = q_site_ls$date %>% max()
-
-end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1]
-
-min_start_date = datemin
-max_start_date = datemax - 15 * 365
-potential_start_date = calc_temporal_permutations(min_start_date, max_start_date)
-max_years_ls = 15  
-
-test_ensemble = foreach(s = 1:length(potential_start_date), .combine = "bind_rows") %do% {
-  
-  foreach(n = 1:max_years_ls, .combine = "bind_rows") %do% {
-    q_site_ls_fil = q_site_ls %>% 
-    filter(date >= potential_start_date[s],
-           date <= potential_start_date[s] + n * 365)
-    
-    if (nrow(q_site_ls_fil %>% filter(cloud_free == T)) == 0) { ## when there is no cloud free image in the date range, assign NA to D and pvalue.
-      temp = ks_stats(x = q_site$discharge, 
-                      y = q_site_ls_fil %>% pull(discharge)) %>% 
-        rename(D_all = D,
-               pvalue_all = pvalue) %>% 
-        bind_cols(tibble(D_cfree = NA,
-                         pvalue_cfree = NA))
-    } else {
-      temp = ks_stats(x = q_site$discharge, 
-                      y = q_site_ls_fil %>% pull(discharge)) %>% 
-        rename(D_all = D,
-               pvalue_all = pvalue) %>% 
-        bind_cols(
-          ks_stats(x = q_site$discharge, 
-                   y = q_site_ls_fil %>% filter(cloud_free == T) %>% pull(discharge)) %>% 
-            rename(D_cfree = D,
-                   pvalue_cfree = pvalue))
-    }
-    
-    temp %>% 
-      mutate(nyears = n, 
-             start_date = potential_start_date[s],
-             end_date = potential_start_date[s] + n * 365)
+run_test = function(x, y, test, verbose) {
+  if (test == "ks") {
+    result = ks.test(x, y, alternative = "two.sided")
+    if (verbose) {print(result)}
+    pvalue = result$p.value
+    statistics = result$statistic
+    output = tibble(pvalue, statistics, test_name = "Two-sample Kolmogorov-Smirnov test", method = "ks")
   }
-    
+  if (test == "ad") {
+    require(kSamples)
+    result = ad.test(x, y, method = "asymptotic")
+    if (verbose) {print(result)}
+    statistics = result$ad[1, 1]
+    pvalue = result$ad[1, 3]
+    output = tibble(pvalue, statistics, test_name = "Anderson-Darling test", method = "ad")
+  }
+  if (test == "ks.boot") {
+    result = Matching::ks.boot(x, y, alternative = "two.sided")
+    if (verbose) {print(result)}
+    statistics = result$ks$statistic
+    pvalue = result$ks.boot.pvalue
+    output = tibble(pvalue, statistics, test_name = "Two-sample Kolmogorov-Smirnov test", method = "ks.boot")
+  }
+  
+  invisible(output)
 }
 
-D_fig = test_ensemble %>% 
-  select(D_all, nyears, D_cfree, start_date) %>% 
-  gather(key = "source",
-         value = "D",
-         -c(nyears, start_date)) %>% 
-  mutate(nyears = as.factor(nyears)) %>% 
+temp_test = function(x, y, verbose = F) {
+  ## test to run for each temporal permutation
+  ## exports the D value, p value, 0, 10, 20, ..., 100th percentile of both x and y
+  
+  ## ks test
+  result = ks.test(x, y, alternative = "two.sided")
+  pvalue = result$p.value
+  statistics = result$statistic
+  
+  percentile = c(0, 0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 1)
+  ps_x = tibble(per = sprintf(as.integer(percentile * 100), fmt = "%03d"), value = quantile(x, probs = percentile, na.rm = T, names = F)) %>% mutate(source = "x") %>% unite(., "pername", source, per, sep = "_") %>% spread(key = pername, value = "value")
+  ps_y = tibble(per = sprintf(as.integer(percentile * 100), fmt = "%03d"), value = quantile(y, probs = percentile, na.rm = T, names = F)) %>% mutate(source = "y") %>% unite(., "pername", source, per, sep = "_") %>% spread(key = pername, value = "value")
+  
+  if (verbose) {print(result)}
+  
+  ## percentile
+  
+  output = tibble(pvalue, statistics, nx = length(x), ny = length(y)) %>% 
+    bind_cols(ps_x, ps_y)
+  
+  return(output)
+}
+
+temporal_permutation = function(start_date, end_date, n_year, n_permutation) {
+  ## define the range possible for the starting date of the temporal sampling
+  min_start_date = start_date
+  max_start_date = end_date - n_year * 365.25
+  
+  start_dates = min_start_date + runif(n = n_permutation) * (max_start_date - min_start_date)
+  
+  return(tibble(start_dates, end_dates = start_dates + n_year * 365.25))
+}
+```
+
+
+## temporal test on one gauge
+## test on one gauge
+
+```{r}
+id = "09070000"
+
+# id = dat_full_discharge %>% 
+#   dplyr::select(site_id) %>% 
+#   distinct() %>% 
+#   sample_n(100) %>% 
+#   pull
+
+print(id)
+
+q_all = dat_full_discharge %>% filter(site_id == id)
+q_ls_cf = ls_discharge %>% filter(site_id == id, cloud_free)
+
+gauge_start_date = q_all$date %>% min()
+gauge_end_date = q_all$date %>% max()
+lscf_start_date = q_ls_cf$date %>% min()
+lscf_end_date = q_ls_cf$date %>% max()
+
+start_date = max(gauge_start_date, lscf_start_date)
+end_date = min(gauge_end_date, lscf_end_date)
+
+years = 1:10
+
+test = foreach(i = years, .combine = "bind_rows") %do% {
+  dates = temporal_permutation(start_date, end_date, n_year = i, n_permutation = 30)
+  dates %>% 
+    mutate(index = 1:nrow(.)) %>% 
+    group_by(index) %>% 
+    do({
+      temp = .
+      
+      ## compare ls discharge with gauge daily discharge for the same i year period
+      # sub_q_all = q_all %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(discharge)
+      # sub_q_lscf = q_ls_cf %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(discharge)
+      
+      ## compare ls discharge with gauge daily discharge (other than the landsat dates) for the same i year period
+      ls_dates = q_ls_cf %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(date)
+      gauge_dates = q_all %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(date)
+      diff_dates = tibble(date = as.Date(setdiff(gauge_dates, ls_dates), origin = "1970-01-01"))
+      sub_q_all = q_all %>% right_join(diff_dates, by = "date") %>% pull(discharge)
+      sub_q_lscf = q_ls_cf %>% right_join(tibble(date = ls_dates), by = "date") %>% pull(discharge)
+      
+      temp_test(x = sub_q_all, y = sub_q_lscf, verbose = F) %>% 
+        mutate(nyear = i)
+    }) %>% 
+    ungroup()
+}
+
+test %>% 
   ggplot() + 
-  geom_boxplot(aes(x = nyears, y = D, fill = source), alpha = 0.4, show.legend = F) +
+  geom_boxplot(aes(x = nyear, y = statistics, group = nyear))
+
+test %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = nyear, y = pvalue, group = nyear))
+
+
+```
+
+### test on all gauges that having temporal range of ls sampling and gauge records greater than 15 years
+
+```{r}
+n_years_gauge = dat_full_discharge %>% 
+  group_by(site_id) %>% 
+  summarise(n_max_year = floor(as.integer(max(date) - min(date)) / 365.25)) %>% 
+  ungroup()
+
+n_years_landsat = ls_discharge %>% 
+  filter(cloud_free) %>% 
+  group_by(site_id) %>% 
+  summarise(n_max_year = floor(as.integer(max(date) - min(date)) / 365.25)) %>% 
+  ungroup()
+
+gauge_id_temporal_analysis = n_years_gauge %>% 
+  filter(n_max_year >= 15) %>% 
+  inner_join(n_years_landsat %>% 
+               filter(n_max_year >= 15), by = "site_id") %>% 
+  select(site_id) %>% 
+  distinct()
+
+N_sites = nrow(gauge_id_temporal_analysis)
+
+for (j in 1:N_sites) {
+  print(paste("starting task", j, "of", N_sites))
+  
+  id = gauge_id_temporal_analysis$site_id[j]
+  
+  print(id)
+  
+  q_all = dat_full_discharge %>% filter(site_id == id)
+  q_ls_cf = ls_discharge %>% filter(site_id == id, cloud_free)
+  
+  gauge_start_date = q_all$date %>% min()
+  gauge_end_date = q_all$date %>% max()
+  lscf_start_date = q_ls_cf$date %>% min()
+  lscf_end_date = q_ls_cf$date %>% max()
+  
+  start_date = max(gauge_start_date, lscf_start_date)
+  end_date = min(gauge_end_date, lscf_end_date)
+  
+  years = 1:10
+  
+  temp_dat = foreach(i = years, .combine = "bind_rows") %do% {
+    dates = temporal_permutation(start_date, end_date, n_year = i, n_permutation = 100)
+    dates %>% 
+      mutate(index = 1:nrow(.)) %>% 
+      group_by(index) %>% 
+      do({
+        temp = .
+        
+        ## compare ls discharge with gauge daily discharge for the same i year period
+        sub_q_all = q_all %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(discharge)
+        sub_q_lscf = q_ls_cf %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(discharge)
+        
+        ## compare ls discharge with gauge daily discharge (other than the landsat dates) for the same i year period
+        # ls_dates = q_ls_cf %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(date)
+        # gauge_dates = q_all %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(date)
+        # diff_dates = tibble(date = as.Date(setdiff(gauge_dates, ls_dates), origin = "1970-01-01"))
+        # sub_q_all = q_all %>% right_join(diff_dates, by = "date") %>% pull(discharge)
+        # sub_q_lscf = q_ls_cf %>% right_join(tibble(date = ls_dates), by = "date") %>% pull(discharge)
+        
+        if (length(sub_q_all) == 0 | length(sub_q_lscf) == 0) {
+          test = test %>% mutate(nyear = -999)
+        } else {
+          temp_test(x = sub_q_all, y = sub_q_lscf, verbose = F) %>% 
+            mutate(nyear = i)
+        }
+        
+      }) %>% 
+      ungroup()
+  } %>% 
+    select(-index) %>% 
+    mutate(site_id = id)
+  
+  if(j == 1) {
+    output = temp_dat
+  } else if (j != 1) {
+    output = bind_rows(output, temp_dat)
+  }
+}
+
+save(output, file = "outputs/output_temporal_analysis_not_exclude_landsat_dates_permu100.RData")
+
+load("outputs/output_temporal_analysis_not_exclude_landsat_dates.RData", verbose = T)
+
+output = output %>% 
+  filter(nyear != -999) %>% 
+  distinct() %>% 
+  mutate(n_day_miss_per_year = ((nx) - nyear * 365.25) / nyear) %>% 
+  filter(n_day_miss_per_year >= -30)
+
+## how many sites included in the analysis
+output %>% 
+  select(site_id) %>% 
+  distinct()
+
+## relationship between median D and nyears
+fig_d_nyear = output %>% 
+  filter(n_day_miss_per_year >= -30) %>% 
+  group_by(nyear, site_id) %>% 
+  summarise(D_median = median(statistics)) %>% 
+  ungroup() %>% 
+  mutate(nyear = as.factor(nyear)) %>% 
+  ggplot() +
+  geom_boxplot(aes(nyear, D_median, group = nyear)) +
+  # geom_dotplot(aes(x = nyear, y = D_median), binaxis = "y", stackdir='center', stackratio=1.5, dotsize = 0.1) +
   labs(
-    x = "No. of years of Landsat data",
-    y = "D",
-    title = this_site_id
+    x = "Years of Landsat observation",
+    y = "Per site median D"
+  ) +
+  theme(panel.background = element_blank(),
+        panel.border = element_rect(fill = NA, colour = "grey"))
+
+fig_d_nyear
+
+fig_d_nyear %>% 
+  ggsave(filename = "figs/summary_figure/fig_d_nyear_permu100.png",
+         width = 5,
+         height = 4,
+         dpi = 300)
+
+output %>% 
+  group_by(nyear, site_id) %>% 
+  summarise(p_median = median(pvalue)) %>% 
+  ungroup() %>% 
+  mutate(nyear = as.factor(nyear)) %>% 
+  ggplot() +
+  geom_boxplot(aes(nyear, p_median, group = nyear)) +
+  labs(
+    x = "Years of Landsat observation",
+    y = "Per site median p value"
   )
 
-D_fig
+output %>% 
+  filter(site_id == "01010000") %>% 
+  ggplot() +
+  geom_abline(aes(slope = 1, intercept = 0), color = "red") +
+  geom_point(aes(x = x_050, y = y_050), alpha = 0.5, size = 1) +
+  scale_x_log10() +
+  scale_y_log10() +
+  facet_wrap(~nyear)
 
-D_fig %>% 
-  ggsave(
-    filename = paste0("figs/", this_site_id, "_D.png"),
-    width = 5,
-    height = 4)
+output_long = output[, c(5:15, 27)] %>% 
+  gather(key = "per", value = "x_value", -c(nyear)) %>% 
+  bind_cols(
+    output[, c(16:26)] %>% 
+      gather(key = "y_per", value = "y_value")) %>% 
+  select(-y_per) %>% 
+  separate(per, into = c(NA, "percentile"), sep = "_")
 
-pvalue_fig = test_ensemble %>% 
-  select(pvalue_all, nyears, pvalue_cfree, start_date) %>% 
-  gather(key = "source",
-         value = "pvalue",
-         -c(nyears, start_date)) %>% 
-  mutate(nyears = as.factor(nyears)) %>% 
-  ggplot() + 
-  geom_boxplot(aes(x = nyears, y = pvalue, fill = source), alpha = 0.4) +
-  labs(
-    fill = "Landsat sampling",
-    x = "No. of years of Landsat data",
-    y = "p-value",
-    title = this_site_id
-  ) +
-  theme(legend.direction = "horizontal",
-        legend.position = "bottom")
+# save(output_long, file = "outputs/output_long_not_exclude_landsat_dates.RData")
 
-pvalue_fig
+load("outputs/output_long_not_exclude_landsat_dates.RData", verbose = T)
 
-pvalue_fig %>% 
-  ggsave(
-    filename = paste0("figs/", this_site_id, "_pvalue.png"),
-    width = 5,
-    height = 4)
+pernames = seq(0, 100, by = 10) %>% sprintf(fmt = "%03d")
+
+for (i in 1:length(pernames)) {
+  
+  output_long_fil = output_long %>% 
+    filter(percentile == pernames[i])
+  
+  error = output_long_fil %>% 
+    mutate(diffyx = y_value - x_value) %>% 
+    group_by(nyear) %>% 
+    summarise(
+      `Mean bias` = mean(diffyx),
+      `Mean absolute error` = mean(abs(diffyx)),
+      `mRMSE` = sqrt(mean(diffyx^2)) / (max(x_value) - min(x_value))
+    ) %>% 
+    ungroup %>% 
+    gather(key = "metric", value = "value", -nyear)
+  
+  error_fig = error %>% 
+    filter(metric == "mRMSE") %>% 
+    ggplot() +
+    geom_line(aes(x = nyear, y = value, color = metric)) +
+    geom_point(aes(x = nyear, y = value, color = metric)) +
+    scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+    labs(
+      x = "Years of observation",
+      y = paste0("Error value (", as.integer(pernames[i]), "th percentile)"),
+      color = "Error metrics"
+    ) +
+    theme(legend.position = c(0.8, 0.8))
+  
+  error_fig %>% 
+    ggsave(filename = paste0("figs/summary_figure/", "error_fig_percentile_", pernames[i], ".png"),
+           width = 5,
+           height = 5)
+    
+  fig = output_long_fil %>% 
+    mutate(nyear = factor(paste(nyear, "year(s) of obs"), ordered = T)) %>% 
+    ggplot() +
+    # geom_hex(aes(x = x_value, y = y_value, fill = log(..count..))) +
+    geom_abline(aes(slope = 1, intercept = 0), color = "red") +
+    geom_point(aes(x = x_value, y = y_value), alpha = 0.1, size = 0.1) +
+    scale_fill_viridis_c() +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(
+      x = paste0(as.integer(pernames[i]), "th percentile discharge (Gauge sampled)"),
+      y = paste0(as.integer(pernames[i]), "th percentile discharge (Landsat sampled)")
+    ) +
+    facet_wrap(~nyear, ncol = 4)
+  
+  fig %>% 
+    ggsave(filename = paste0("figs/summary_figure/", "xy_fig_percentile_", pernames[i], ".png"),
+           width = 10,
+           height = 7)
+}
+
+error = output_long %>% 
+    mutate(diffyx = y_value - x_value) %>% 
+    group_by(nyear, percentile) %>% 
+    summarise(
+      `Mean bias` = mean(diffyx),
+      `Mean absolute error` = mean(abs(diffyx)),
+      `mRMSE` = sqrt(mean(diffyx^2)) / (max(x_value) - min(x_value))
+    ) %>% 
+    ungroup %>% 
+    gather(key = "metric", value = "value", -c(nyear, percentile))
+
+nrmse_fig = error %>% 
+  filter(metric == "mRMSE") %>% 
+  ggplot(aes(x = nyear, y = value)) +
+  geom_line(aes(color = percentile)) +
+  geom_point(aes(color = percentile)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+  labs(x = "Years of observation",
+       y = "mRMSE (%)",
+       color = "Discharge\npercentile")
+
+nrmse_fig
+
+nrmse_fig %>% 
+  ggsave(filename = "figs/summary_figure/nrmse_permu100_fig.png",
+         width = 6,
+         height = 4,
+         dpi = 300)
+
+selected_percentiles = output_long %>% 
+  filter(percentile %in% c("001", "005", "050", "095", "099"),
+         nyear %in% c(1, 2, 5, 8, 10)) %>% 
+  mutate(nyear = factor(paste(sprintf(nyear, fmt = "%02d"), "year(s) of obs"), ordered = T)) %>% 
+  ggplot() +
+    # geom_hex(aes(x = x_value, y = y_value, fill = log(..count..))) +
+    geom_abline(aes(slope = 1, intercept = 0), color = "red") +
+    geom_point(aes(x = x_value, y = y_value), alpha = 0.1, size = 0.1) +
+    scale_fill_viridis_c() +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(
+      x = "Percentile discharge (Gauge sampled; cms)",
+      y = "Percentile discharge (Landsat sampled; cms)"
+    ) +
+    facet_grid(percentile~nyear)
+
+selected_percentiles
+
+selected_percentiles %>% 
+  ggsave(filename = "figs/summary_figure/selected_percentile_permu100.png",
+         width = 8,
+         height = 8,
+         dpi = 300)
 ```
 
-## map the gauge stations
+## change point map
 
 ```{r}
-site_stats = merged %>% 
+load("outputs/output_long_not_exclude_landsat_dates.RData", verbose = T)
+
+output %>% select(site_id)
+
+output %>% filter(site_id == "01010000") %>% select(nyear, statistics, site_id)
+
+output %>% 
+  group_by(site_id) %>% 
+  summarise(nyear_distinct = length(unique(nyear))) %>% 
+  ungroup() %>% 
+  ggplot() +
+  geom_histogram(aes(x = nyear_distinct))
+
+sites_with_10distinct_years = output %>% 
+  group_by(site_id) %>% 
+  summarise(nyear_distinct = length(unique(nyear))) %>% 
+  ungroup() %>% 
+  filter(nyear_distinct == 10) %>% 
+  select(site_id)
+
+output %>% filter(site_id == "01042500") %>% 
+  ggplot() +
+  geom_boxplot(aes(x = nyear, y = statistics, group = nyear))
+
+## one example time series for change detection
+test = output %>% filter(site_id == "06652000") %>% group_by(nyear) %>% summarise(D_median = median(statistics)) %>% ungroup()
+
+test_ts = ts(test$D_median, start = 1, end = 10)
+
+fs = Fstats(test_ts ~ 1, from = 0.05, to = 0.95)
+breakpoint = breakpoints(fs)
+plot(test_ts, type = "b", pch = 20)
+lines(breakpoint)
+
+bp_table = output %>% 
+  right_join(sites_with_10distinct_years, by = "site_id") %>% 
+  group_by(site_id, nyear) %>% 
+  summarise(D_median = median(statistics)) %>% 
+  ungroup() %>% 
   group_by(site_id) %>% 
   do({
     dat = .
-    dat_ls = dat %>% filter(!is.na(satellite))
-    dat_ls_cf = dat_ls %>% filter(cloud_free == T)
-    
-    ls_ls_all = ks_stats(dat$discharge, dat_ls$discharge) %>% 
-      mutate(source = "ls_all")
-    ls_ls_cf = ks_stats(dat$discharge, dat_ls_cf$discharge) %>% 
-      mutate(source = "ls_cfree")
-    bind_rows(ls_ls_all, ls_ls_cf)
+    test_ts = ts(dat$D_median, start = 1, end = 10)
+    fs = Fstats(test_ts ~ 1, from = 0.05, to = 0.95)
+    breakpoint = breakpoints(fs)
+    tibble(bp = breakpoint$breakpoints)
   }) %>% 
   ungroup()
 
-site_stats = site_stats %>% 
-  separate(site_id, into = c("X", "site_id"), sep = "X", remove = T, convert = T) %>%
-  mutate(site_id = sprintf("%08d", site_id)) %>% 
-  select(-X)
+bp_table %>% filter(bp <= 5) %>% arrange(desc(bp))
 
-site_info = read_csv(file = "data/SiteAttributes.csv") %>% 
-  mutate(site_id = sprintf("%08d", site_no)) %>% 
-  select(lon = dec_long_va, 
-         lat = dec_lat_va,
-         site_id) %>% 
-  distinct()
 
-site_stats_sf = site_stats %>% 
-  inner_join(site_info %>% st_as_sf(coords = c("lon", "lat"), crs = 4326), by = "site_id") %>% 
-  st_as_sf()
-
-require(mapview)
-mapview::mapView(site_stats_sf %>% filter(source == "ls_cfree", site_id == "02236125"))
+site_lonlat %>% 
+  left_join(bp_table %>% filter(bp >= 2), by = "site_id") %>% 
+  ggplot() +
+  geom_point(aes(x = lon, y = lat, color = bp)) +
+  scale_colour_viridis_c(limits = c(2, 9))
 ```
 
+
+<!-- ## test on one gauge -->
+
+<!-- ```{r} -->
+<!-- id = "09070000" -->
+
+<!-- # id = dat_full_discharge %>%  -->
+<!-- #   dplyr::select(site_id) %>%  -->
+<!-- #   distinct() %>%  -->
+<!-- #   sample_n(100) %>%  -->
+<!-- #   pull -->
+
+<!-- print(id) -->
+
+<!-- q_all = dat_full_discharge %>% filter(site_id == id) -->
+<!-- q_ls_all = ls_discharge %>% filter(site_id == id) -->
+<!-- # q_ls_cf = q_ls_all %>% filter(cloud_free) -->
+
+<!-- test_ks = run_test(q_all$discharge, q_ls_all$discharge, test = "ks", verbose = F) -->
+<!-- test_ks_boot = run_test(q_all$discharge, q_ls_all$discharge, test = "ks.boot", verbose = F) -->
+<!-- test_ad = run_test(q_all$discharge, q_ls_all$discharge, test = "ad", verbose = F) -->
+
+<!-- tests = bind_rows(test_ks, test_ks_boot, test_ad) %>%  -->
+<!--   mutate(diff = pvalue <= 0.05, -->
+<!--          result = factor(diff, levels = c(TRUE, FALSE), labels = c("Different", "Not Different"))) -->
+
+<!-- require(gridExtra) -->
+<!-- site_fig = ggplot() + -->
+<!--   geom_density(data = q_all, aes(x = discharge, fill = "gauge_all"), alpha = 0.5) + -->
+<!--   geom_density(data = q_ls_all, aes(x = discharge, fill = "landsat_all"), alpha = 0.5) + -->
+<!--   annotation_custom(tableGrob(tests %>% dplyr::select(method, result), rows = NULL)) + -->
+<!--   scale_x_log10() + -->
+<!--   labs( -->
+<!--     x = "Discharge", -->
+<!--     y = "Density", -->
+<!--     fill = "Data", -->
+<!--     title = id, -->
+<!--     subtitle = paste0("N_gauge: ", nrow(q_all), "\nN_landsat: ", nrow(q_ls_all)) -->
+<!--   ) -->
+
+<!-- site_fig -->
+
+<!-- ``` -->
+
+
+<!-- ## test on all gauges -->
+
+<!-- ```{r} -->
+
+<!-- ids = dat_full_discharge %>%  -->
+<!--   group_by(site_id) %>%  -->
+<!--   count() %>%  -->
+<!--   ungroup() %>%  -->
+<!--   arrange(n) %>%  -->
+<!--   dplyr::select(site_id) %>%  -->
+<!--   pull -->
+
+<!-- N = ids %>% length -->
+
+<!-- t1 = Sys.time() -->
+<!-- for (i in 1:N) { -->
+
+<!--   print(paste0("processing ", i, " of ", N)) -->
+<!--   id = ids[i] -->
+
+<!--   q_all = dat_full_discharge %>% filter(site_id == id) -->
+<!--   q_ls_all = ls_discharge %>% filter(site_id == id) -->
+<!--   # q_ls_cf = q_ls_all %>% filter(cloud_free) -->
+
+<!--   test_ks = run_test(q_all$discharge, q_ls_all$discharge, test = "ks", verbose = F) -->
+<!--   test_ks_boot = run_test(q_all$discharge, q_ls_all$discharge, test = "ks.boot", verbose = F) -->
+<!--   test_ad = run_test(q_all$discharge, q_ls_all$discharge, test = "ad", verbose = F) -->
+
+<!--   tests = bind_rows(test_ks, test_ks_boot, test_ad) %>%  -->
+<!--     mutate(diff = pvalue <= 0.05, -->
+<!--            result = factor(diff, levels = c(TRUE, FALSE), labels = c("Different", "Not Different"))) %>%  -->
+<!--     mutate(site_id = id) -->
+
+<!--   if (i == 1) { -->
+<!--     output = tests -->
+<!--   } else if (i > 1) { -->
+<!--     output = bind_rows(output, tests) -->
+<!--   } -->
+
+<!--   require(gridExtra) -->
+<!--   density = ggplot() + -->
+<!--     geom_density(data = q_all, aes(x = discharge, fill = "gauge_all"), alpha = 0.5) + -->
+<!--     geom_density(data = q_ls_all, aes(x = discharge, fill = "landsat_all"), alpha = 0.5) + -->
+<!--     # annotation_custom(tableGrob(tests %>% dplyr::select(method, result, pvalue), rows = NULL)) + -->
+<!--     scale_x_log10() + -->
+<!--     labs( -->
+<!--       x = "Discharge", -->
+<!--       y = "Density", -->
+<!--       fill = "Data", -->
+<!--       title = id, -->
+<!--       subtitle = paste0("N_gauge: ", nrow(q_all), "\nN_lands at: ", nrow(q_ls_all)) -->
+<!--     ) -->
+
+<!--   table = tableGrob(tests %>% dplyr::select(method, result, pvalue), rows = NULL) -->
+
+<!--   site_fig = grid.arrange(density, table, ncol = 1, heights = c(5, 1)) -->
+
+<!--   site_fig %>%  -->
+<!--     ggsave( -->
+<!--       filename = paste0("figs/dist_comp_gauge_landsat/", sprintf(i, fmt = "%04d"), "_", id, ".png"), -->
+<!--       width = 8, -->
+<!--       height = 8, -->
+<!--       dpi = 300) -->
+<!-- } -->
+
+<!-- save(output, file = "outputs/output_all_gauge.RData") -->
+
+<!-- print(paste("time taken", Sys.time() - t1)) -->
+
+
+
+<!-- t1 = Sys.time() -->
+<!-- for (i in 1:N) { -->
+
+<!--   print(paste0("processing ", i, " of ", N)) -->
+<!--   id = ids[i] -->
+
+<!--   q_all = dat_full_discharge %>% filter(site_id == id) %>% pull(discharge) -->
+<!--   q_ls_all = ls_discharge %>% filter(site_id == id) %>% pull(discharge) -->
+<!--   q_ls_cf = ls_discharge %>% filter(site_id == id, cloud_free) %>% pull(discharge) -->
+
+<!--   q100 = quantile(q_all, probs = seq(0, 1, length = 101)) -->
+<!--   q100_ls_all = quantile(q_ls_all, probs = seq(0, 1, length = 101)) -->
+<!--   q100_ls_cf = quantile(q_ls_cf, probs = seq(0, 1, length = 101)) -->
+
+<!--   lm_ls_all = lm(q100_ls_all~q100) -->
+<!--   lm_ls_cf = lm(q100_ls_cf~q100) -->
+
+<!--   k_ls_all = lm_ls_all$coefficients[2] -->
+<!--   r2_ls_all = summary(lm_ls_all)$r.squared -->
+
+<!--   k_ls_cf = lm_ls_cf$coefficients[2] -->
+<!--   r2_ls_cf = summary(lm_ls_cf)$r.squared -->
+
+<!--   tests = tibble(site_id = id, k_ls_all, r2_ls_all, k_ls_cf, r2_ls_cf) -->
+
+<!--   if (i == 1) { -->
+<!--     output2 = tests -->
+<!--   } else if (i > 1) { -->
+<!--     output2 = bind_rows(output2, tests) -->
+<!--   } -->
+
+<!-- } -->
+
+
+<!-- output2 %>%  -->
+<!--   left_join(output, by = "site_id") %>%  -->
+<!--   ggplot() + -->
+<!--   geom_point(aes(x = r2_ls_all, y = pvalue), alpha = 0.3) + -->
+<!--   scale_x_log10() + -->
+<!--   facet_wrap(~method) -->
+
+<!-- output2 %>%  -->
+<!--   left_join(output, by = "site_id") %>%  -->
+<!--   ggplot() + -->
+<!--   geom_point(aes(x = k_ls_all, y = pvalue), alpha = 0.3) + -->
+<!--   facet_wrap(~method) -->
+<!-- ``` -->
+
+
+<!-- ### map the test results -->
+
+<!-- ```{r} -->
+<!-- n_ls = ls_discharge %>%  -->
+<!--   group_by(site_id) %>%  -->
+<!--   count() %>%  -->
+<!--   ungroup -->
+
+<!-- output %>%  -->
+<!--   filter(method != "ks.boot") %>%  -->
+<!--   group_by(site_id) %>%  -->
+<!--   summarise(consistent = factor(diff %>% unique %>% length, levels = 1:2, labels = c("Consistent", "Inconsistent"))) %>%  -->
+<!--   ungroup() %>%  -->
+<!--   filter(consistent == "Inconsistent") %>%  -->
+<!--   left_join(n_ls) %>%  -->
+<!--   arrange(n) -->
+
+<!-- ``` -->
+
+<!-- ## test on one site with permutation on the starting date -->
+
+<!-- ```{r} -->
+<!-- calc_temporal_permutations = function(min_start_date, max_start_date, seed = 2019, N = 30) { -->
+<!--   set.seed(seed) -->
+
+<!--   return(tibble(possible_start_dates = seq.Date(from = min_start_date, to = max_start_date, by = 1)) %>%  -->
+<!--     sample_n(N) %>%  -->
+<!--       pull(possible_start_dates)) -->
+<!-- } -->
+
+<!-- ks_stats = function(x, y) { -->
+<!--   temp = Matching::ks.boot(x, y, nboots = 100) -->
+<!--   return(tibble(D = temp$ks$statistic,  -->
+<!--                 p.value = temp$ks$p.value, -->
+<!--                 ks.boot.pvalue = temp$ks.boot.pvalue)) -->
+<!-- } -->
+
+<!-- this_site_id = "01010000" -->
+<!-- this_site_id = "02236125" -->
+<!-- # this_site_id = "14211720" -->
+
+<!-- q_gauge = dat_full_discharge %>%  -->
+<!--   filter(site_id == this_site_id) -->
+
+<!-- q_ls_all = ls_discharge %>%  -->
+<!--   filter(site_id == this_site_id) -->
+
+<!-- q_ls_cf = q_ls_all %>%  -->
+<!--   filter(cloud_free) -->
+
+<!-- datemin = q_ls_all$date %>% min() -->
+<!-- datemax = q_ls_all$date %>% max() -->
+
+<!-- end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1] -->
+
+<!-- min_start_date = datemin -->
+<!-- max_start_date = datemax - 15 * 365 -->
+<!-- potential_start_date = calc_temporal_permutations(min_start_date, max_start_date) -->
+<!-- max_years_ls = 15 -->
+
+<!-- t1 = Sys.time() -->
+<!-- test_ensemble = foreach(s = 1:length(potential_start_date), .combine = "bind_rows") %do% { -->
+
+<!--   foreach(n = 1:max_years_ls, .combine = "bind_rows") %do% { -->
+
+<!--     this_start_date = potential_start_date[s] -->
+<!--     this_end_date = potential_start_date[s] + n * 365 -->
+
+<!--     # q_gauge_fil = q_gauge %>%  -->
+<!--     #   filter(date >= this_start_date, -->
+<!--     #          date <= this_end_date) -->
+
+<!--     q_ls_all_fil = q_ls_all %>%  -->
+<!--       filter(date >= this_start_date, -->
+<!--              date <= this_end_date) -->
+
+<!--     q_ls_cf_fil = q_ls_cf %>%  -->
+<!--       filter(date >= this_start_date, -->
+<!--              date <= this_end_date) -->
+
+<!--     ks_none = tibble( -->
+<!--       D = NA, -->
+<!--       p.value = NA, -->
+<!--       ks.boot.pvalue = NA -->
+<!--     ) -->
+
+<!--     if (nrow(q_ls_cf_fil) > 0) { -->
+<!--       ks_cf = ks_stats(x = q_ls_cf_fil$discharge,  -->
+<!--                        y = q_gauge$discharge) %>%  -->
+<!--         mutate(type = "ls_cloud_free") -->
+<!--     } else { -->
+<!--       ks_cf = ks_none %>%  -->
+<!--         mutate(type = "ls_cloud_free") -->
+<!--     } -->
+
+<!--     if (nrow(q_ls_all_fil) > 0) { -->
+<!--       ks_all = ks_stats(x = q_ls_all_fil$discharge,  -->
+<!--                        y = q_gauge$discharge) %>%  -->
+<!--         mutate(type = "ls_all_return") -->
+<!--     } else { -->
+<!--       ks_all = ks_none %>%  -->
+<!--         mutate(type = "ls_all_return") -->
+<!--     } -->
+
+<!--     ks_all %>%  -->
+<!--       bind_rows(ks_cf) %>%  -->
+<!--       mutate(nyears = n,  -->
+<!--              start_date = this_start_date, -->
+<!--              end_date = this_end_date) -->
+<!--   } -->
+
+<!-- } -->
+<!-- print(paste0("time elapsed: ", Sys.time() - t1)) -->
+
+<!-- test_ensemble = test_ensemble %>%  -->
+<!--   mutate(nyears = as.factor(nyears)) -->
+
+<!-- D_fig = test_ensemble %>%  -->
+<!--   ggplot() +  -->
+<!--   geom_boxplot(aes(x = nyears, y = D, fill = type), alpha = 0.4, show.legend = F) + -->
+<!--   labs( -->
+<!--     x = "No. of years of Landsat data", -->
+<!--     y = "D", -->
+<!--     title = this_site_id -->
+<!--   ) -->
+
+<!-- D_fig -->
+
+<!-- D_fig %>% -->
+<!--   ggsave( -->
+<!--     filename = paste0("figs/ksboot/", this_site_id, "_D.png"), -->
+<!--     width = 5, -->
+<!--     height = 4) -->
+
+<!-- boot_pvalue_fig = test_ensemble %>%  -->
+<!--   ggplot() +  -->
+<!--   geom_boxplot(aes(x = nyears, y = ks.boot.pvalue, fill = type), alpha = 0.4) + -->
+<!--   labs( -->
+<!--     fill = "Landsat sampling", -->
+<!--     x = "No. of years of Landsat data", -->
+<!--     y = "p-value", -->
+<!--     title = this_site_id -->
+<!--   ) + -->
+<!--   theme(legend.direction = "horizontal", -->
+<!--         legend.position = "bottom") -->
+
+<!-- boot_pvalue_fig -->
+
+<!-- boot_pvalue_fig %>% -->
+<!--   ggsave( -->
+<!--     filename = paste0("figs/ksboot/", this_site_id, "_boot_pvalue.png"), -->
+<!--     width = 5, -->
+<!--     height = 4) -->
+
+<!-- pvalue_fig = test_ensemble %>%  -->
+<!--   ggplot() +  -->
+<!--   geom_boxplot(aes(x = nyears, y = p.value, fill = type), alpha = 0.4) + -->
+<!--   labs( -->
+<!--     fill = "Landsat sampling", -->
+<!--     x = "No. of years of Landsat data", -->
+<!--     y = "p-value", -->
+<!--     title = this_site_id -->
+<!--   ) + -->
+<!--   theme(legend.direction = "horizontal", -->
+<!--         legend.position = "bottom") -->
+
+<!-- pvalue_fig -->
+
+<!-- pvalue_fig %>% -->
+<!--   ggsave( -->
+<!--     filename = paste0("figs/ksboot/", this_site_id, "_pvalue.png"), -->
+<!--     width = 5, -->
+<!--     height = 4) -->
+<!-- ``` -->
+
+
+<!-- ## test on 100 sites with permutation on the starting date -->
+
+<!-- ```{r} -->
+<!-- calc_temporal_permutations = function(min_start_date, max_start_date, seed = 2019, N = 30) { -->
+<!--   set.seed(seed) -->
+
+<!--   return(tibble(possible_start_dates = seq.Date(from = min_start_date, to = max_start_date, by = 1)) %>%  -->
+<!--     sample_n(N) %>%  -->
+<!--       pull(possible_start_dates)) -->
+<!-- } -->
+
+<!-- ks_stats = function(x, y) { -->
+<!--   temp = Matching::ks.boot(x, y, nboots = 50) -->
+<!--   return(tibble(D = temp$ks$statistic,  -->
+<!--                 p.value = temp$ks$p.value, -->
+<!--                 ks.boot.pvalue = temp$ks.boot.pvalue)) -->
+<!-- } -->
+
+<!-- set.seed(2019) -->
+<!-- sites100 = dat_full_discharge %>%  -->
+<!--   select(site_id) %>%  -->
+<!--   distinct() %>%  -->
+<!--   sample_n(100) %>%  -->
+<!--   pull(site_id) -->
+
+<!-- for (i in 51:100) { -->
+
+<!--   this_site_id = sites100[i] -->
+
+<!--   q_gauge = dat_full_discharge %>%  -->
+<!--     filter(site_id == this_site_id) -->
+
+<!--   q_ls_all = ls_discharge %>%  -->
+<!--     filter(site_id == this_site_id) -->
+
+<!--   q_ls_cf = q_ls_all %>%  -->
+<!--     filter(cloud_free) -->
+
+<!--   datemin = q_ls_all$date %>% min() -->
+<!--   datemax = q_ls_all$date %>% max() -->
+
+<!--   end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1] -->
+
+<!--   min_start_date = datemin -->
+<!--   max_start_date = datemax - 15 * 365 -->
+
+<!--   if (min_start_date >= max_start_date) next -->
+
+<!--   potential_start_date = calc_temporal_permutations(min_start_date, max_start_date) -->
+<!--   max_years_ls = 15 -->
+
+<!--   t1 = Sys.time() -->
+<!--   tmp_ensemble = foreach(s = 1:length(potential_start_date), .combine = "bind_rows") %do% { -->
+
+<!--     foreach(n = 1:max_years_ls, .combine = "bind_rows") %do% { -->
+
+<!--       this_start_date = potential_start_date[s] -->
+<!--       this_end_date = potential_start_date[s] + n * 365 -->
+
+<!--       # q_gauge_fil = q_gauge %>%  -->
+<!--       #   filter(date >= this_start_date, -->
+<!--       #          date <= this_end_date) -->
+
+<!--       q_ls_all_fil = q_ls_all %>%  -->
+<!--         filter(date >= this_start_date, -->
+<!--                date <= this_end_date) -->
+
+<!--       q_ls_cf_fil = q_ls_cf %>%  -->
+<!--         filter(date >= this_start_date, -->
+<!--                date <= this_end_date) -->
+
+<!--       ks_none = tibble( -->
+<!--         D = NA, -->
+<!--         p.value = NA, -->
+<!--         ks.boot.pvalue = NA -->
+<!--       ) -->
+
+<!--       if (nrow(q_ls_cf_fil) > 0) { -->
+<!--         ks_cf = ks_stats(x = q_ls_cf_fil$discharge,  -->
+<!--                          y = q_gauge$discharge) %>%  -->
+<!--           mutate(type = "ls_cloud_free") -->
+<!--       } else { -->
+<!--         ks_cf = ks_none %>%  -->
+<!--           mutate(type = "ls_cloud_free") -->
+<!--       } -->
+
+<!--       if (nrow(q_ls_all_fil) > 0) { -->
+<!--         ks_all = ks_stats(x = q_ls_all_fil$discharge,  -->
+<!--                          y = q_gauge$discharge) %>%  -->
+<!--           mutate(type = "ls_all_return") -->
+<!--       } else { -->
+<!--         ks_all = ks_none %>%  -->
+<!--           mutate(type = "ls_all_return") -->
+<!--       } -->
+
+<!--       ks_all %>%  -->
+<!--         bind_rows(ks_cf) %>%  -->
+<!--         mutate(nyears = n,  -->
+<!--                start_date = this_start_date, -->
+<!--                end_date = this_end_date, -->
+<!--                site_id = this_site_id) -->
+<!--     } -->
+
+<!--   } -->
+<!--   if (i != 1) { -->
+<!--     result = bind_rows(result, tmp_ensemble) -->
+<!--   } else if (i == 1) { -->
+<!--     result = tmp_ensemble -->
+<!--   } -->
+<!--   print(paste0("time elapsed for station ", i, ": ", Sys.time() - t1)) -->
+<!-- } -->
+
+<!-- # save(result, file = "outputs/tmp_result_100sites.RData") -->
+<!-- ``` -->
+
+<!-- ## map the difference -->
+
+<!-- ```{r} -->
+<!-- result = result %>%  -->
+<!--   mutate(nyears = factor(nyears)) %>%  -->
+<!--   filter(!is.na(ks.boot.pvalue)) # remove those with no landsat obs -->
+
+<!-- ratio_sig_diff = result %>%  -->
+<!--   group_by(site_id, nyears, type) %>%  -->
+<!--   summarise(r_sig_diff_test = sum(ks.boot.pvalue <= 0.05) / n(), -->
+<!--             n = n()) %>%  -->
+<!--   ungroup() -->
+
+<!-- set.seed(2019) -->
+<!-- D_fig = result %>%  -->
+<!--   select(site_id) %>%  -->
+<!--   distinct() %>%  -->
+<!--   sample_n(9) %>%  -->
+<!--   left_join(result) %>%  -->
+<!--   left_join(ratio_sig_diff) %>%  -->
+<!--   ggplot() + -->
+<!--   geom_boxplot(aes(x = nyears, y = D, lty = type, fill = r_sig_diff_test * 100)) + -->
+<!--   facet_wrap(~site_id, scale = "free_y") + -->
+<!--   scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 50, limits = c(0, 100), guide = guide_colorbar(title.position = "top", title.hjust = 0.5, barwidth = unit(80, units = "mm"), barheight = unit(5, units = "mm"), direction = "horizontal")) + -->
+<!--   scale_linetype_discrete(guide = guide_legend(title.position = "top", title.hjust = 0.5, direction = "vertical")) + -->
+<!--   theme(legend.position = "bottom") + -->
+<!--   labs(x = "Number of years of Landsat observation", -->
+<!--        y = "D value", -->
+<!--        fill = "% of ks.boot tests\nshowing significant (p < 0.05) difference", -->
+<!--        lty = "Cloud filter") -->
+
+<!-- D_fig -->
+
+<!-- D_fig %>%  -->
+<!--   ggsave(filename = "figs/D_fig9.png", -->
+<!--          width = 8, -->
+<!--          height = 6) -->
+
+
+<!-- set.seed(2019) -->
+<!-- result %>%  -->
+<!--   select(site_id) %>%  -->
+<!--   distinct() %>%  -->
+<!--   sample_n(9) %>%  -->
+<!--   left_join(result) %>% -->
+<!--   ggplot() + -->
+<!--   geom_boxplot(aes(x = nyears, y = ks.boot.pvalue, fill = type)) + -->
+<!--   facet_wrap(~site_id) -->
+<!-- ``` -->
+
+<!-- ## test on 100 sites with permutation on the starting date comparing subset of daily gauge data with entire gauge data records -->
+
+<!-- ```{r} -->
+<!-- calc_temporal_permutations = function(min_start_date, max_start_date, seed = 2019, N = 30) { -->
+<!--   set.seed(seed) -->
+
+<!--   return(tibble(possible_start_dates = seq.Date(from = min_start_date, to = max_start_date, by = 1)) %>%  -->
+<!--     sample_n(N) %>%  -->
+<!--       pull(possible_start_dates)) -->
+<!-- } -->
+
+<!-- ks_stats = function(x, y, test) { -->
+<!--   if (test == "ks.boot") { -->
+<!--     temp = Matching::ks.boot(x, y, nboots = 50) -->
+<!--     return(tibble(D = temp$ks$statistic,  -->
+<!--                   p.value = temp$ks$p.value, -->
+<!--                   ks.boot.pvalue = temp$ks.boot.pvalue)) -->
+<!--   } -->
+
+<!--   if (test == "wilcox.test") { -->
+<!--     temp = wilcox.test(x, y) -->
+<!--     return(tibble(D = temp$statistic,  -->
+<!--                   ks.boot.pvalue = temp$p.value)) -->
+<!--   } -->
+
+<!-- } -->
+
+<!-- set.seed(2019) -->
+<!-- sites100 = dat_full_discharge %>%  -->
+<!--   select(site_id) %>%  -->
+<!--   distinct() %>%  -->
+<!--   sample_n(100) %>%  -->
+<!--   pull(site_id) -->
+
+<!-- for (i in 1:9) { -->
+
+<!--   this_site_id = sites100[i] -->
+
+<!--   q_gauge = dat_full_discharge %>%  -->
+<!--     filter(site_id == this_site_id) -->
+
+<!--   # q_gauge_sub = ls_discharge %>%  -->
+<!--   #   filter(site_id == this_site_id) -->
+<!--   #  -->
+<!--   # q_ls_cf = q_ls_all %>%  -->
+<!--   #   filter(cloud_free) -->
+
+<!--   datemin = q_gauge$date %>% min() -->
+<!--   datemax = q_gauge$date %>% max() -->
+
+<!--   end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1] -->
+
+<!--   min_start_date = datemin -->
+<!--   max_start_date = datemax - 15 * 365 -->
+
+<!--   if (min_start_date >= max_start_date) next -->
+
+<!--   potential_start_date = calc_temporal_permutations(min_start_date, max_start_date) -->
+<!--   max_years_ls = 15 -->
+
+<!--   t1 = Sys.time() -->
+<!--   tmp_ensemble = foreach(s = 1:length(potential_start_date), .combine = "bind_rows") %do% { -->
+
+<!--     foreach(n = 1:max_years_ls, .combine = "bind_rows") %do% { -->
+
+<!--       this_start_date = potential_start_date[s] -->
+<!--       this_end_date = potential_start_date[s] + n * 365 -->
+
+<!--       # q_gauge_fil = q_gauge %>%  -->
+<!--       #   filter(date >= this_start_date, -->
+<!--       #          date <= this_end_date) -->
+
+<!--       q_gauge_fil = q_gauge %>%  -->
+<!--         filter(date >= this_start_date, -->
+<!--                date <= this_end_date) -->
+
+<!--       # q_ls_all_fil = q_ls_all %>%  -->
+<!--       #   filter(date >= this_start_date, -->
+<!--       #          date <= this_end_date) -->
+<!--       #  -->
+<!--       # q_ls_cf_fil = q_ls_cf %>%  -->
+<!--       #   filter(date >= this_start_date, -->
+<!--       #          date <= this_end_date) -->
+
+<!--       ks_none = tibble( -->
+<!--         D = NA, -->
+<!--         p.value = NA, -->
+<!--         ks.boot.pvalue = NA -->
+<!--       ) -->
+
+<!--       if (nrow(q_gauge_fil) > 0) { -->
+<!--         ks_sub_gauge = ks_stats(x = q_gauge_fil$discharge,  -->
+<!--                          y = q_gauge$discharge) %>%  -->
+<!--           mutate(type = "sub_gauge") -->
+<!--       } else { -->
+<!--         ks_sub_gauge = ks_none %>%  -->
+<!--           mutate(type = "ls_cloud_free") -->
+<!--       } -->
+
+<!--       ks_sub_gauge %>%  -->
+<!--         mutate(nyears = n,  -->
+<!--                start_date = this_start_date, -->
+<!--                end_date = this_end_date, -->
+<!--                site_id = this_site_id) -->
+<!--     } -->
+
+<!--   } -->
+<!--   if (i != 1) { -->
+<!--     subgauge = bind_rows(subgauge, tmp_ensemble) -->
+<!--   } else if (i == 1) { -->
+<!--     subgauge = tmp_ensemble -->
+<!--   } -->
+<!--   print(paste0("time elapsed for station ", i, ": ", Sys.time() - t1)) -->
+<!-- } -->
+
+
+<!-- for (i in 1:9) { -->
+
+<!--   this_site_id = sites100[i] -->
+
+<!--   q_gauge = dat_full_discharge %>%  -->
+<!--     filter(site_id == this_site_id) -->
+
+<!--   # q_gauge_sub = ls_discharge %>%  -->
+<!--   #   filter(site_id == this_site_id) -->
+<!--   #  -->
+<!--   # q_ls_cf = q_ls_all %>%  -->
+<!--   #   filter(cloud_free) -->
+
+<!--   datemin = q_gauge$date %>% min() -->
+<!--   datemax = q_gauge$date %>% max() -->
+
+<!--   end_dates = seq.Date(from = datemin, to = datemax, by = 365)[-1] -->
+
+<!--   min_start_date = datemin -->
+<!--   max_start_date = datemax - 15 * 365 -->
+
+<!--   if (min_start_date >= max_start_date) next -->
+
+<!--   potential_start_date = calc_temporal_permutations(min_start_date, max_start_date) -->
+<!--   max_years_ls = 15 -->
+
+<!--   t1 = Sys.time() -->
+<!--   tmp_ensemble = foreach(s = 1:length(potential_start_date), .combine = "bind_rows") %do% { -->
+
+<!--     foreach(n = 1:max_years_ls, .combine = "bind_rows") %do% { -->
+
+<!--       this_start_date = potential_start_date[s] -->
+<!--       this_end_date = potential_start_date[s] + n * 365 -->
+
+<!--       # q_gauge_fil = q_gauge %>%  -->
+<!--       #   filter(date >= this_start_date, -->
+<!--       #          date <= this_end_date) -->
+
+<!--       q_gauge_fil = q_gauge %>%  -->
+<!--         filter(date >= this_start_date, -->
+<!--                date <= this_end_date) -->
+
+<!--       # q_ls_all_fil = q_ls_all %>%  -->
+<!--       #   filter(date >= this_start_date, -->
+<!--       #          date <= this_end_date) -->
+<!--       #  -->
+<!--       # q_ls_cf_fil = q_ls_cf %>%  -->
+<!--       #   filter(date >= this_start_date, -->
+<!--       #          date <= this_end_date) -->
+
+<!--       ks_none = tibble( -->
+<!--         D = NA, -->
+<!--         p.value = NA, -->
+<!--         ks.boot.pvalue = NA -->
+<!--       ) -->
+
+<!--       if (nrow(q_gauge_fil) > 0) { -->
+<!--         ks_sub_gauge = ks_stats(x = q_gauge_fil$discharge,  -->
+<!--                          y = q_gauge$discharge, test = "wilcox.test") %>%  -->
+<!--           mutate(type = "sub_gauge") -->
+<!--       } else { -->
+<!--         ks_sub_gauge = ks_none %>%  -->
+<!--           mutate(type = "ls_cloud_free") -->
+<!--       } -->
+
+<!--       ks_sub_gauge %>%  -->
+<!--         mutate(nyears = n,  -->
+<!--                start_date = this_start_date, -->
+<!--                end_date = this_end_date, -->
+<!--                site_id = this_site_id) -->
+<!--     } -->
+
+<!--   } -->
+<!--   if (i != 1) { -->
+<!--     subgauge = bind_rows(subgauge, tmp_ensemble) -->
+<!--   } else if (i == 1) { -->
+<!--     subgauge = tmp_ensemble -->
+<!--   } -->
+<!--   print(paste0("time elapsed for station ", i, ": ", Sys.time() - t1)) -->
+<!-- } -->
+
+<!-- # save(result, file = "outputs/tmp_result_100sites.RData") -->
+<!-- ``` -->
+
+
+<!-- ## map the difference -->
+
+<!-- ```{r} -->
+<!-- subgauge = subgauge %>%  -->
+<!--   mutate(nyears = factor(nyears)) %>%  -->
+<!--   filter(!is.na(ks.boot.pvalue)) # remove those with no landsat obs -->
+
+<!-- ratio_sig_diff_subgauge = subgauge %>%  -->
+<!--   group_by(site_id, nyears, type) %>%  -->
+<!--   summarise(r_sig_diff_test = sum(ks.boot.pvalue <= 0.05) / n(), -->
+<!--             n = n()) %>%  -->
+<!--   ungroup() -->
+
+<!-- set.seed(2019) -->
+<!-- D_fig = subgauge %>%  -->
+<!--   select(site_id) %>%  -->
+<!--   distinct() %>%  -->
+<!--   sample_n(9) %>% -->
+<!--   left_join(subgauge) %>%  -->
+<!--   left_join(ratio_sig_diff_subgauge) %>%  -->
+<!--   ggplot() + -->
+<!--   geom_boxplot(aes(x = nyears, y = D, fill = r_sig_diff_test * 100)) + -->
+<!--   facet_wrap(~site_id, scale = "free_y") + -->
+<!--   scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 50, limits = c(0, 100), guide = guide_colorbar(title.position = "top", title.hjust = 0.5, barwidth = unit(80, units = "mm"), barheight = unit(5, units = "mm"), direction = "horizontal")) + -->
+<!--   theme(legend.position = "bottom") + -->
+<!--   labs(x = "Number of years of Landsat observation", -->
+<!--        y = "D value", -->
+<!--        fill = "% of ks.boot tests\nshowing significant (p < 0.05) difference", -->
+<!--        lty = "Cloud filter") -->
+
+<!-- D_fig -->
+
+<!-- D_fig %>% -->
+<!--   ggsave(filename = "figs/D_subgauge_fig9.png", -->
+<!--          width = 8, -->
+<!--          height = 6) -->
+
+
+<!-- # set.seed(2019) -->
+<!-- # result %>%  -->
+<!-- #   select(site_id) %>%  -->
+<!-- #   distinct() %>%  -->
+<!-- #   sample_n(9) %>%  -->
+<!-- #   left_join(result) %>% -->
+<!-- #   ggplot() + -->
+<!-- #   geom_boxplot(aes(x = nyears, y = ks.boot.pvalue, fill = type)) + -->
+<!-- #   facet_wrap(~site_id) -->
+<!-- ``` -->
+
+<!-- ## map the gauge stations -->
+
+<!-- ```{r} -->
+<!-- site_stats = merged %>%  -->
+<!--   group_by(site_id) %>%  -->
+<!--   do({ -->
+<!--     dat = . -->
+<!--     dat_ls = dat %>% filter(!is.na(satellite)) -->
+<!--     dat_ls_cf = dat_ls %>% filter(cloud_free == T) -->
+
+<!--     ls_ls_all = ks_stats(dat$discharge, dat_ls$discharge) %>%  -->
+<!--       mutate(source = "ls_all") -->
+<!--     ls_ls_cf = ks_stats(dat$discharge, dat_ls_cf$discharge) %>%  -->
+<!--       mutate(source = "ls_cfree") -->
+<!--     bind_rows(ls_ls_all, ls_ls_cf) -->
+<!--   }) %>%  -->
+<!--   ungroup() -->
+
+<!-- site_stats = site_stats %>%  -->
+<!--   separate(site_id, into = c("X", "site_id"), sep = "X", remove = T, convert = T) %>% -->
+<!--   mutate(site_id = sprintf("%08d", site_id)) %>%  -->
+<!--   select(-X) -->
+
+<!-- site_info = read_csv(file = "data/SiteAttributes.csv") %>%  -->
+<!--   mutate(site_id = sprintf("%08d", site_no)) %>%  -->
+<!--   select(lon = dec_long_va,  -->
+<!--          lat = dec_lat_va, -->
+<!--          site_id) %>%  -->
+<!--   distinct() -->
+
+<!-- site_stats_sf = site_stats %>%  -->
+<!--   inner_join(site_info %>% st_as_sf(coords = c("lon", "lat"), crs = 4326), by = "site_id") %>%  -->
+<!--   st_as_sf() -->
+
+<!-- require(mapview) -->
+<!-- mapview::mapView(site_stats_sf %>% filter(source == "ls_cfree", site_id == "02236125")) -->
+<!-- ``` -->
+
+
+<!-- ## try man-whitney test -->
+
+<!-- ## pvalue wil-cox rank test -->
