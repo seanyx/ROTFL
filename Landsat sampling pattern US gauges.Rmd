@@ -5,6 +5,10 @@ date: "8/21/2019"
 output: html_document
 ---
 
+Last update: 12/26/2019
+
+# Load packages and functions
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -12,12 +16,9 @@ require(tidyverse)
 require(sf)
 require(foreach)
 
-load("outputs/dat_full_discharge_cleaned_20191001.RData", verbose = T)
-load("outputs/dat_landsat_discharge_cleaned_20191001.RData", verbose = T)
-load("outputs/site_lonlat_20191001.RData", verbose = T)
-
-# x = rnorm(n = 10)
-# y = x + 0.1
+load("outputs/dat_full_discharge_cleaned_20191226.RData", verbose = T)
+load("outputs/dat_landsat_discharge_cleaned_20191226.RData", verbose = T)
+load("outputs/site_lonlat_20191226.RData", verbose = T)
 
 run_test = function(x, y, test, verbose) {
   if (test == "ks") {
@@ -55,7 +56,7 @@ temp_test = function(x, y, verbose = F) {
   pvalue = result$p.value
   statistics = result$statistic
   
-  percentile = c(0, 0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 1)
+  percentile = c(0, 0.01, 0.05, 0.5, 0.95, 0.99, 1)
   ps_x = tibble(per = sprintf(as.integer(percentile * 100), fmt = "%03d"), value = quantile(x, probs = percentile, na.rm = T, names = F)) %>% mutate(source = "x") %>% unite(., "pername", source, per, sep = "_") %>% spread(key = pername, value = "value")
   ps_y = tibble(per = sprintf(as.integer(percentile * 100), fmt = "%03d"), value = quantile(y, probs = percentile, na.rm = T, names = F)) %>% mutate(source = "y") %>% unite(., "pername", source, per, sep = "_") %>% spread(key = pername, value = "value")
   
@@ -80,9 +81,256 @@ temporal_permutation = function(start_date, end_date, n_year, n_permutation) {
 }
 ```
 
+# Replicate fig3 by George
 
-## temporal test on one gauge
-## test on one gauge
+```{r}
+pers = c(0, 1, 5, 10, 50, 90, 95, 99, 100)
+
+dat_full_discharge = dat_full_discharge %>% 
+  filter(discharge > 0)
+
+ls_discharge = ls_discharge %>% 
+  filter(discharge > 0)
+
+for (i in 1:length(pers)) {
+  
+  print(pers[i])
+  
+  temp1 = dat_full_discharge %>% 
+    group_by(site_id) %>% 
+    summarise(quantiles_gauge = quantile(discharge, probs = pers[i] / 100)) %>% 
+    ungroup() %>% 
+    mutate(per = as.character(pers[i]))
+  
+  temp2 = ls_discharge %>% 
+    group_by(site_id) %>% 
+    summarise(quantiles_ls = quantile(discharge, probs = pers[i] / 100)) %>% 
+    ungroup() %>% 
+    mutate(per = as.character(pers[i]))
+  
+  if (i == 1) {
+    gauge_pers = temp1
+    ls_pers = temp2
+  } else if (i != 1) {
+      gauge_pers = bind_rows(gauge_pers, temp1)
+      ls_pers = bind_rows(ls_pers, temp2)
+    }
+}
+
+merged = gauge_pers %>% 
+  inner_join(ls_pers, by = c("site_id", "per"))
+
+merged = merged %>% 
+  mutate(label = factor(per, levels = as.character(pers), labels = paste0("Quantile: ", pers, "%"), ordered = T))
+
+### test error metrics
+merged %>% ggplot() + geom_point(aes(x = quantiles_gauge, y = quantiles_ls - quantiles_gauge), pch = 1) + facet_wrap(~label, scales = "free_y") + labs(x = "Qpopulation (cms)", y = "Qsample - Qpopulation (cms)") + scale_x_log10()
+
+# notice the range of y values
+merged %>% ggplot() + geom_point(aes(x = quantiles_gauge, y = (quantiles_ls - quantiles_gauge) / quantiles_gauge), pch = 1) + facet_wrap(~label, scales = "free_y") + labs(x = "Qpopulation (cms)", y = "(Qsample - Qpopulation) / Qpopulation") + scale_x_log10()
+### end of test
+
+test_result = merged %>% 
+  group_by(label) %>% 
+  do({
+    top = .
+    # top = merged %>% filter(per == "0")
+    
+    ### linear fit
+    fit = lm(quantiles_ls ~ quantiles_gauge, data = top)
+    b = fit$coefficients[1]
+    k = fit$coefficients[2]
+    fit_string = paste0("y = ", format(k, digits = 2), "x ", if (abs(b) == b) "+ " else "- ", format(abs(b), digits = 2))
+    
+    ### sen slope
+    fit_sen = zyp::zyp.sen(quantiles_ls ~ quantiles_gauge, data = top)
+    b_sen = fit_sen$coefficients[1]
+    k_sen = fit_sen$coefficients[2]
+    fit_string_sen = paste0("y = ", format(k_sen, digits = 2), "x ", if (abs(b_sen) == b_sen) "+ " else "- ", format(abs(b_sen), digits = 1))
+    
+    ### for visualization
+    fit_sen_log = zyp::zyp.sen(quantiles_ls ~ quantiles_gauge, data = top %>% mutate(quantiles_ls = log10(quantiles_ls), quantiles_gauge = log10(quantiles_gauge)))
+    b_sen_log = fit_sen_log$coefficients[1]
+    k_sen_log = fit_sen_log$coefficients[2]
+    
+    ### R2
+    r2 = (fit %>% summary)$r.squared
+    r2_string = paste0("R2 = ", format(r2, digits = 2))
+    
+    ### rrmse and rbias
+    error_stats = top %>% 
+      mutate(dif = quantiles_ls - quantiles_gauge) %>% 
+      summarise(rrmse = sqrt(mean((dif / quantiles_gauge)^2)),
+                rbias = mean(dif / quantiles_gauge))
+    
+    rrmse_string = paste0("rRMSE: ", format(error_stats$rrmse, digits = 2))
+    rbias_string = paste0("rBias: ", format(error_stats$rbias, digits = 2))
+    
+    ### ks test
+    ks = ks.test(x = top$quantiles_gauge, y = top$quantiles_ls)
+    D = ks$statistic
+    p = ks$p.value
+    ks_D_string = paste0("K-S D: ", format(D, digits = 2))
+    ks_pvalue_string = if (p < 0.01) "K-S p < 0.01" else paste0("K-S p: ", format(p, digits = 2))
+    
+    ### xy lim for plotting text
+    xmin = top$quantiles_gauge %>% min
+    xmax = top$quantiles_gauge %>% max
+    ymin = top$quantiles_ls %>% min
+    ymax = top$quantiles_ls %>% max
+    
+    ### wilcox
+    wc = wilcox.test(x = top$quantiles_gauge, y = top$quantiles_ls)
+    p = wc$p.value
+    wc_pvalue_string = if (p < 0.01) "MWW p < 0.01" else paste0("MWW p: ", format(p, digits = 2))
+    
+    tibble(meta = paste0(c(fit_string_sen, r2_string, rrmse_string, rbias_string,
+           ks_D_string, wc_pvalue_string), collapse = "\n"), b_sen = b_sen, k_sen = k_sen, xmin, xmax, ymin, ymax)
+  }) %>% 
+  ungroup()
+
+## test values from first calculating metrics for individual gauge
+merged %>% 
+  filter(quantiles_gauge != 0,
+         quantiles_ls != 0) %>% 
+  mutate(bias = quantiles_ls - quantiles_gauge,
+         relative_bias = bias / quantiles_gauge) %>% 
+  ggplot() +
+  geom_histogram(aes(relative_bias), binwidth = 0.01) + 
+  xlim(0, 1) +
+  facet_wrap(~label)
+  
+
+fig3 = merged %>% 
+  ggplot(aes(x = quantiles_gauge, y = quantiles_ls)) +
+  geom_abline(aes(slope = 1, intercept = 0), color = "black", lwd = 0.5) +
+  geom_point(size = 1, alpha = 0.4, pch = 1) +
+  geom_abline(data = test_result, aes(intercept = b_sen, slope = k_sen), color = "red") +
+  # geom_smooth(method = lm, color = "red", lwd = 0.25, fullrange = T) +
+  # geom_text(data = test_result, aes(x = 1e3, y = 1e-2, label = meta), size = 7 * 0.35, hjust = 0, vjust = 0) +
+  geom_text(data = test_result, aes(x = xmax * 0.65, y = 1e-3, label = meta), size = 7 * 0.35, hjust = 0, vjust = 0) +
+  # scale_x_log10() +
+  # scale_y_log10() +
+  # scale_x_log10(limits = c(1e-2, 1e6)) +
+  # scale_y_log10(limits = c(1e-2, 1e6)) +
+  # coord_equal() +
+  labs(x = "Qpopulation (cms)",
+       y = "Qsample (cms)") +
+  facet_wrap(~label, ncol = 3, scales = "free") +
+  theme(panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"))
+
+fig3
+
+fig3 %>% 
+  ggsave(filename = "figs/fig3_sen_slope_linear_scale.png",
+         width = 7.5,
+         height = 7.5,
+         dpi = "print")
+
+fig3 %>% 
+  ggsave(filename = "figs/fig3_sen_slope_linear_scale.pdf",
+         width = 7.5,
+         height = 7.5,
+         dpi = "print")
+```
+
+## test shift function approach
+
+```{r}
+this_site_id = "01010000"
+
+x = dat_full_discharge %>% 
+  filter(site_id == this_site_id) %>% 
+  pull(discharge)
+
+y = ls_discharge %>% 
+  filter(site_id == this_site_id,
+         cloud_free) %>% 
+  pull(discharge)
+
+levels = c(0, 0.01, 0.1, 0.5, 0.9, 0.99, 1)
+t1 = Sys.time()
+test = qcomhd(x = y, y = x, nboot = 100, q = levels, plotit = F)
+print(Sys.time() - t1)
+
+test %>% 
+  mutate(q = factor(q, levels = levels, labels = paste0(levels * 100, "%"))) %>% 
+  ggplot() + 
+  geom_errorbar(aes(x = q, ymin = ci.low, ymax = ci.up)) + 
+  geom_line(aes(x = 1:7, y = est.1_minus_est.2), color = "grey") + 
+  geom_point(aes(x = q, y = est.1_minus_est.2)) +
+  labs(x = "Quantiles",
+       y = "Qsample - Qpopulation (cms)")
+
+sampled_ids = dat_full_discharge %>% 
+  select(site_id) %>% 
+  distinct()# %>% sample_n(1)
+
+t1 = Sys.time()
+test_msites = sampled_ids %>% 
+  group_by(site_id) %>% 
+  do({
+    dat = .
+    this_site_id = dat$site_id[1]
+    
+    x = dat_full_discharge %>% 
+      filter(site_id == this_site_id) %>% 
+      pull(discharge)
+    
+    y = ls_discharge %>% 
+      filter(site_id == this_site_id,
+             cloud_free) %>% 
+      pull(discharge)
+    
+    levels = c(0, 0.01, 0.1, 0.5, 0.9, 0.99, 1)
+    # t1 = Sys.time()
+    qcomhd(x = y, y = x, nboot = 100, q = levels, SEED = T, plotit = F) %>% 
+      as_tibble()
+    # print(Sys.time() - t1)
+  }) %>% 
+  ungroup()
+print(Sys.time() - t1)
+
+save(test_msites, file = "outputs/test_msites.RData")
+
+# test_msites %>% 
+#   mutate(q = factor(q, levels = levels, labels = paste0(levels * 100, "%"))) %>% 
+#   ggplot() + 
+#   geom_errorbar(aes(x = q, ymin = ci.low, ymax = ci.up)) + 
+#   # geom_line(aes(x = 1:7, y = est.1_minus_est.2), color = "grey") + 
+#   geom_point(aes(x = q, y = est.1_minus_est.2)) +
+#   labs(x = "Quantiles",
+#        y = "Qsample - Qpopulation (cms)") +
+#   facet_wrap(~site_id, scales = "free_y")
+
+test_msites %>% 
+  mutate(q = factor(q, levels = levels, labels = paste0(levels * 100, "%"))) %>% 
+  ggplot() + 
+  geom_bar(aes(x = q, fill = signif))
+
+test_msites %>% 
+  mutate(q = factor(q, levels = levels, labels = paste0(levels * 100, "%"))) %>% 
+  ggplot() + 
+  geom_bar(aes(x = q, fill = ci.low * ci.up >= 0))
+
+
+
+id = "03253500"
+ls_discharge %>% filter(site_id == id) %>% nrow()
+ggplot() +
+  geom_density(data = dat_full_discharge %>% filter(site_id == id), aes(discharge, fill = "full"), alpha = 0.5) +
+  geom_density(data = ls_discharge %>% filter(site_id == id), aes(discharge, fill = "ls"), alpha = 0.5) +
+  scale_x_log10()
+```
+
+
+
+# Temporal test
+
+## One gauge
 
 ```{r}
 id = "09070000"
@@ -144,8 +392,12 @@ test %>%
 
 ```
 
-### test on all gauges that having temporal range of ls sampling and gauge records greater than 15 years
+## All gauges that having temporal range of both Landsat sampling and gauge records greater than 15 years
 
+1. Calculate for each gauge the duration of available flow data;
+2. For gauges having greater than 15 years of both gauge and Landsat data (N = 927), randomly generate 50 intervals within N year duration (N = 1, 2, 3, ..., 10), for each pair of flow data conducted K-S test and caclulated quantile values at 0%, 1%, 5%, 10%, 50%, 90%, 95%, 99%, and 100%;
+
+### 1 & 2
 ```{r}
 n_years_gauge = dat_full_discharge %>% 
   group_by(site_id) %>% 
@@ -167,16 +419,19 @@ gauge_id_temporal_analysis = n_years_gauge %>%
 
 N_sites = nrow(gauge_id_temporal_analysis)
 
+## default value when no values returned when filtering records to a given duration
+default_test = tibble(pvalue = NA, statistics = NA, nx = -999, ny = -999)
+
 for (j in 1:N_sites) {
-  print(paste("starting task", j, "of", N_sites))
   
   id = gauge_id_temporal_analysis$site_id[j]
   
-  print(id)
+  print(paste("starting task", j, "of", N_sites, ": ", id))
   
-  q_all = dat_full_discharge %>% filter(site_id == id)
-  q_ls_cf = ls_discharge %>% filter(site_id == id, cloud_free)
+  q_all = dat_full_discharge %>% filter(site_id == id) ## daily discharge data at gauge
+  q_ls_cf = ls_discharge %>% filter(site_id == id, cloud_free) ## discharge data observed by LS when cloud free
   
+  ## calculate temporal intersection between ranges from gauge and Landsat
   gauge_start_date = q_all$date %>% min()
   gauge_end_date = q_all$date %>% max()
   lscf_start_date = q_ls_cf$date %>% min()
@@ -185,10 +440,12 @@ for (j in 1:N_sites) {
   start_date = max(gauge_start_date, lscf_start_date)
   end_date = min(gauge_end_date, lscf_end_date)
   
+  ## for each given temporal interval (in years), generate random intervals to compare the discharge from gauge and observed by Landsat
   years = 1:10
-  
   temp_dat = foreach(i = years, .combine = "bind_rows") %do% {
-    dates = temporal_permutation(start_date, end_date, n_year = i, n_permutation = 100)
+    
+    dates = temporal_permutation(start_date, end_date, n_year = i, n_permutation = 50) ## generate N = 50 random intervals
+    
     dates %>% 
       mutate(index = 1:nrow(.)) %>% 
       group_by(index) %>% 
@@ -199,15 +456,9 @@ for (j in 1:N_sites) {
         sub_q_all = q_all %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(discharge)
         sub_q_lscf = q_ls_cf %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(discharge)
         
-        ## compare ls discharge with gauge daily discharge (other than the landsat dates) for the same i year period
-        # ls_dates = q_ls_cf %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(date)
-        # gauge_dates = q_all %>% filter(date >= temp$start_dates[1], date <= temp$end_dates[1]) %>% pull(date)
-        # diff_dates = tibble(date = as.Date(setdiff(gauge_dates, ls_dates), origin = "1970-01-01"))
-        # sub_q_all = q_all %>% right_join(diff_dates, by = "date") %>% pull(discharge)
-        # sub_q_lscf = q_ls_cf %>% right_join(tibble(date = ls_dates), by = "date") %>% pull(discharge)
-        
+        ## if either of sub_q_all or sub_q_lscf were 0, return the default value of the test result then remove them afterwards
         if (length(sub_q_all) == 0 | length(sub_q_lscf) == 0) {
-          test = test %>% mutate(nyear = -999)
+          default_test %>% mutate(nyear = -999)
         } else {
           temp_test(x = sub_q_all, y = sub_q_lscf, verbose = F) %>% 
             mutate(nyear = i)
@@ -226,15 +477,18 @@ for (j in 1:N_sites) {
   }
 }
 
-save(output, file = "outputs/output_temporal_analysis_not_exclude_landsat_dates_permu100.RData")
+save(output, file = "outputs/output_temporal_analysis_not_exclude_landsat_dates_permu50_newBreakpoint.RData")
+```
 
-load("outputs/output_temporal_analysis_not_exclude_landsat_dates.RData", verbose = T)
+### Relationship between comparison and years of observations
+```{r }
+load("outputs/output_temporal_analysis_not_exclude_landsat_dates_permu50_newBreakpoint.RData", verbose = T)
 
 output = output %>% 
   filter(nyear != -999) %>% 
   distinct() %>% 
-  mutate(n_day_miss_per_year = ((nx) - nyear * 365.25) / nyear) %>% 
-  filter(n_day_miss_per_year >= -30)
+  mutate(n_day_miss_per_year = ((nx) - nyear * 365.25) / nyear) # estimate how many days were missing for one year 
+  # filter(n_day_miss_per_year >= -30)
 
 ## how many sites included in the analysis
 output %>% 
@@ -242,18 +496,19 @@ output %>%
   distinct()
 
 ## relationship between median D and nyears
+### 1. for each interval length and for each gauge, calculate the median D values
+### 2. plot the median value against the interval length
 fig_d_nyear = output %>% 
-  filter(n_day_miss_per_year >= -30) %>% 
+  # filter(n_day_miss_per_year >= -30) %>% 
   group_by(nyear, site_id) %>% 
   summarise(D_median = median(statistics)) %>% 
   ungroup() %>% 
   mutate(nyear = as.factor(nyear)) %>% 
   ggplot() +
   geom_boxplot(aes(nyear, D_median, group = nyear)) +
-  # geom_dotplot(aes(x = nyear, y = D_median), binaxis = "y", stackdir='center', stackratio=1.5, dotsize = 0.1) +
   labs(
-    x = "Years of Landsat observation",
-    y = "Per site median D"
+    x = "Landsat observation interval (years)",
+    y = "Median D value"
   ) +
   theme(panel.background = element_blank(),
         panel.border = element_rect(fill = NA, colour = "grey"))
@@ -261,152 +516,374 @@ fig_d_nyear = output %>%
 fig_d_nyear
 
 fig_d_nyear %>% 
-  ggsave(filename = "figs/summary_figure/fig_d_nyear_permu100.png",
-         width = 5,
-         height = 4,
+  ggsave(filename = "figs/fig_d_nyear_permu50.png",
+         width = 3.74,
+         height = 3.75,
          dpi = 300)
 
-output %>% 
-  group_by(nyear, site_id) %>% 
-  summarise(p_median = median(pvalue)) %>% 
-  ungroup() %>% 
-  mutate(nyear = as.factor(nyear)) %>% 
-  ggplot() +
-  geom_boxplot(aes(nyear, p_median, group = nyear)) +
-  labs(
-    x = "Years of Landsat observation",
-    y = "Per site median p value"
-  )
+# output %>% 
+#   group_by(nyear, site_id) %>% 
+#   summarise(p_median = median(pvalue)) %>% 
+#   ungroup() %>% 
+#   mutate(nyear = as.factor(nyear)) %>% 
+#   ggplot() +
+#   geom_boxplot(aes(nyear, p_median, group = nyear)) +
+#   labs(
+#     x = "Years of Landsat observation",
+#     y = "Per site median p value"
+#   )
 
-output %>% 
-  filter(site_id == "01010000") %>% 
-  ggplot() +
-  geom_abline(aes(slope = 1, intercept = 0), color = "red") +
-  geom_point(aes(x = x_050, y = y_050), alpha = 0.5, size = 1) +
-  scale_x_log10() +
-  scale_y_log10() +
-  facet_wrap(~nyear)
-
-output_long = output[, c(5:15, 27)] %>% 
+output_long = output[, c(5:11, 19)] %>% 
   gather(key = "per", value = "x_value", -c(nyear)) %>% 
   bind_cols(
-    output[, c(16:26)] %>% 
+    output[, c(12:18)] %>% 
       gather(key = "y_per", value = "y_value")) %>% 
   select(-y_per) %>% 
   separate(per, into = c(NA, "percentile"), sep = "_")
 
-# save(output_long, file = "outputs/output_long_not_exclude_landsat_dates.RData")
+# save(output_long, file = "outputs/output_long_not_exclude_landsat_dates_new_breakPoints.RData")
 
-load("outputs/output_long_not_exclude_landsat_dates.RData", verbose = T)
+load("outputs/output_long_not_exclude_landsat_dates_new_breakPoints.RData", verbose = T)
 
-pernames = seq(0, 100, by = 10) %>% sprintf(fmt = "%03d")
+# pernames = seq(0, 100, by = 10) %>% sprintf(fmt = "%03d")
+# 
+# for (i in 1:length(pernames)) {
+#   
+#   output_long_fil = output_long %>% 
+#     filter(percentile == pernames[i])
+#   
+#   error = output_long_fil %>% 
+#     mutate(diffyx = y_value - x_value) %>% 
+#     group_by(nyear) %>% 
+#     summarise(
+#       `Mean bias` = mean(diffyx),
+#       `Mean absolute error` = mean(abs(diffyx)),
+#       `mRMSE` = sqrt(mean(diffyx^2)) / (max(x_value) - min(x_value))
+#     ) %>% 
+#     ungroup %>% 
+#     gather(key = "metric", value = "value", -nyear)
+#   
+#   error_fig = error %>% 
+#     filter(metric == "mRMSE") %>% 
+#     ggplot() +
+#     geom_line(aes(x = nyear, y = value, color = metric)) +
+#     geom_point(aes(x = nyear, y = value, color = metric)) +
+#     scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+#     labs(
+#       x = "Years of observation",
+#       y = paste0("Error value (", as.integer(pernames[i]), "th percentile)"),
+#       color = "Error metrics"
+#     ) +
+#     theme(legend.position = c(0.8, 0.8))
+#   
+#   error_fig %>% 
+#     ggsave(filename = paste0("figs/summary_figure/", "error_fig_percentile_", pernames[i], ".png"),
+#            width = 5,
+#            height = 5)
+#     
+#   fig = output_long_fil %>% 
+#     mutate(nyear = factor(paste(nyear, "year(s) of obs"), ordered = T)) %>% 
+#     ggplot() +
+#     # geom_hex(aes(x = x_value, y = y_value, fill = log(..count..))) +
+#     geom_abline(aes(slope = 1, intercept = 0), color = "red") +
+#     geom_point(aes(x = x_value, y = y_value), alpha = 0.1, size = 0.1) +
+#     scale_fill_viridis_c() +
+#     scale_x_log10() +
+#     scale_y_log10() +
+#     labs(
+#       x = paste0(as.integer(pernames[i]), "th percentile discharge (Gauge sampled)"),
+#       y = paste0(as.integer(pernames[i]), "th percentile discharge (Landsat sampled)")
+#     ) +
+#     facet_wrap(~nyear, ncol = 4)
+#   
+#   fig %>% 
+#     ggsave(filename = paste0("figs/summary_figure/", "xy_fig_percentile_", pernames[i], ".png"),
+#            width = 10,
+#            height = 7)
+# }
 
-for (i in 1:length(pernames)) {
-  
-  output_long_fil = output_long %>% 
-    filter(percentile == pernames[i])
-  
-  error = output_long_fil %>% 
-    mutate(diffyx = y_value - x_value) %>% 
-    group_by(nyear) %>% 
-    summarise(
-      `Mean bias` = mean(diffyx),
-      `Mean absolute error` = mean(abs(diffyx)),
-      `mRMSE` = sqrt(mean(diffyx^2)) / (max(x_value) - min(x_value))
-    ) %>% 
-    ungroup %>% 
-    gather(key = "metric", value = "value", -nyear)
-  
-  error_fig = error %>% 
-    filter(metric == "mRMSE") %>% 
-    ggplot() +
-    geom_line(aes(x = nyear, y = value, color = metric)) +
-    geom_point(aes(x = nyear, y = value, color = metric)) +
-    scale_x_continuous(breaks = seq(1, 10, by = 1)) +
-    labs(
-      x = "Years of observation",
-      y = paste0("Error value (", as.integer(pernames[i]), "th percentile)"),
-      color = "Error metrics"
-    ) +
-    theme(legend.position = c(0.8, 0.8))
-  
-  error_fig %>% 
-    ggsave(filename = paste0("figs/summary_figure/", "error_fig_percentile_", pernames[i], ".png"),
-           width = 5,
-           height = 5)
-    
-  fig = output_long_fil %>% 
-    mutate(nyear = factor(paste(nyear, "year(s) of obs"), ordered = T)) %>% 
-    ggplot() +
-    # geom_hex(aes(x = x_value, y = y_value, fill = log(..count..))) +
-    geom_abline(aes(slope = 1, intercept = 0), color = "red") +
-    geom_point(aes(x = x_value, y = y_value), alpha = 0.1, size = 0.1) +
-    scale_fill_viridis_c() +
-    scale_x_log10() +
-    scale_y_log10() +
-    labs(
-      x = paste0(as.integer(pernames[i]), "th percentile discharge (Gauge sampled)"),
-      y = paste0(as.integer(pernames[i]), "th percentile discharge (Landsat sampled)")
-    ) +
-    facet_wrap(~nyear, ncol = 4)
-  
-  fig %>% 
-    ggsave(filename = paste0("figs/summary_figure/", "xy_fig_percentile_", pernames[i], ".png"),
-           width = 10,
-           height = 7)
-}
+output_long = output_long %>% 
+  mutate(x_value = x_value * 0.0283168,
+         y_value = y_value * 0.0283168)
 
 error = output_long %>% 
+    filter(x_value != 0,
+           y_value != 0) %>% 
     mutate(diffyx = y_value - x_value) %>% 
     group_by(nyear, percentile) %>% 
     summarise(
-      `Mean bias` = mean(diffyx),
-      `Mean absolute error` = mean(abs(diffyx)),
-      `mRMSE` = sqrt(mean(diffyx^2)) / (max(x_value) - min(x_value))
+      Bias = mean(diffyx),
+      rBias = mean(diffyx / x_value, na.rm = T),
+      MAE = mean(abs(diffyx)),
+      rMAE = mean(abs(diffyx / x_value), na.rm = T),
+      RMSE = sqrt(mean((diffyx)^2)),
+      rRMSE = sqrt(mean((diffyx / x_value)^2)),
+      R2 = (lm(y_value ~ x_value) %>% summary)$r.squared
     ) %>% 
     ungroup %>% 
     gather(key = "metric", value = "value", -c(nyear, percentile))
 
-nrmse_fig = error %>% 
-  filter(metric == "mRMSE") %>% 
+abs_error_fig = error %>% 
+  # filter(metric %in% c("rBias", "rMAE", "rRMSE")) %>%
+  filter(metric %in% c("Bias", "MAE", "RMSE")) %>%
+  ggplot(aes(x = nyear, y = value)) +
+  geom_line(aes(color = percentile)) +
+  geom_point(aes(color = percentile)) +
+  # scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+  labs(x = "Years of observation",
+       y = "Discharge (cms)",
+       color = "Discharge\npercentile") +
+  facet_wrap(~metric, scales = "free_y") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "lightgrey"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        axis.title.y = element_blank())
+  
+abs_error_fig
+
+abs_error_fig %>% 
+  ggsave(filename = "figs/relative_error_permu50_fig_absolute_error.png",
+         width = 6,
+         height = 3,
+         dpi = 300)
+
+rel_error_fig = error %>% 
+  filter(metric %in% c("rBias", "rMAE", "rRMSE")) %>%
   ggplot(aes(x = nyear, y = value)) +
   geom_line(aes(color = percentile)) +
   geom_point(aes(color = percentile)) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
   scale_x_continuous(breaks = seq(1, 10, by = 1)) +
   labs(x = "Years of observation",
-       y = "mRMSE (%)",
-       color = "Discharge\npercentile")
+       y = "",
+       color = "Discharge\npercentile") +
+  facet_wrap(~metric, scales = "free_y") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "lightgrey"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        axis.title.y = element_blank())
+  
+rel_error_fig
 
-nrmse_fig
-
-nrmse_fig %>% 
-  ggsave(filename = "figs/summary_figure/nrmse_permu100_fig.png",
+rel_error_fig %>% 
+  ggsave(filename = "figs/relative_error_permu50_fig_relative_error.png",
          width = 6,
+         height = 3,
+         dpi = 300)
+
+r2_error_fig = error %>% 
+  # filter(metric %in% c("rBias", "rMAE", "rRMSE")) %>%
+  filter(metric %in% c("R2")) %>%
+  ggplot(aes(x = nyear, y = value)) +
+  geom_line(aes(color = percentile)) +
+  geom_point(aes(color = percentile)) +
+  # scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+  labs(x = "Years of observation",
+       y = "",
+       color = "Discharge\npercentile") +
+  facet_wrap(~metric, scales = "free_y") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "lightgrey"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        axis.title.y = element_blank())
+
+r2_error_fig
+
+r2_error_fig %>% 
+  ggsave(filename = "figs/relative_error_permu50_fig_r2_error_newsize.png",
+         width = 3.5,
          height = 4,
          dpi = 300)
 
+pvalue_boxplot = output %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = nyear, y = pvalue, group = nyear)) +
+  labs(
+    x = "Years of observation",
+    y = "K-S pvalue"
+  ) +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+axis.title.y = element_blank())
+
+pvalue_boxplot
+
+pvalue_boxplot %>% 
+  ggsave(
+    filename = "figs/pvalue_boxplot.png",
+    width = 3,
+    height = 3,
+    dpi = 300
+  )
+```
+
+### Define D value to map the gauges
+
+Gave up for D evaluation can be unstable when there was few discharge data from Landsat overpassing
+```{r}
+load("outputs/output_temporal_analysis_not_exclude_landsat_dates_permu50_newBreakpoint.RData", verbose = T)
+
+output = output %>% 
+  filter(nyear != -999) %>% 
+  distinct() %>% 
+  mutate(n_day_miss_per_year = ((nx) - nyear * 365.25) / nyear)
+
+output %>% 
+  group_by(nyear, site_id) %>% 
+  summarise(medianD = mean(statistics)) %>% 
+  ungroup %>% 
+  mutate(nyear = as.factor(nyear)) %>% 
+  # filter(nyear == 1) %>% 
+  ggplot() +
+  geom_line(aes(x = nyear, y = medianD, group = site_id), lwd = 0.5, alpha = 0.2)
+
+output_long %>% 
+  ggplot() +
+  geom_boxplot()
+
+output %>% 
+  filter(site_id == "01030500") %>% 
+  ggplot() +
+  geom_boxplot(aes(x = nyear, y = statistics, group = nyear)) +
+  geom_hline(aes(yintercept = 0.1), color = "red")
+
+output_long2 = output[, c(5:11, 19, 20)] %>% 
+  gather(key = "per", value = "x_value", -c(nyear, site_id)) %>% 
+  separate(per, into = c(NA, "percentile"), sep = "_") %>% 
+  inner_join(
+    output[, c(12:18, 19, 20)] %>% 
+      gather(key = "per", value = "y_value", -c(nyear, site_id)) %>% 
+      separate(per, into = c(NA, "percentile"), sep = "_")
+    , by = c("nyear", "site_id", "percentile"))
+
+output_long2 %>% 
+  filter(site_id == "01030500") %>% 
+  group_by(percentile, nyear) %>% 
+  summarise(x_median = median(x_value),
+            y_median = median(y_value)) %>% 
+  ungroup() %>% 
+  mutate(nyear = as.factor(nyear)) %>% 
+  ggplot() +
+  geom_line(aes(x = x_median, y = y_median, group = nyear), color = "grey") +
+  geom_point(aes(x = x_median, y = y_median, color = nyear, group = nyear)) +
+  scale_color_viridis_d()
+
+output_long2 %>% 
+  filter(site_id == "01030500") %>% 
+  mutate(nyear = as.factor(nyear)) %>% 
+  # gather(key = "source", value = "value", -c(percentile, site_id, nyear)) %>% 
+  ggplot() +
+  geom_density(aes(x = y_value - x_value, fill = percentile), alpha = 0.3) +
+  facet_wrap(~nyear, scales = "free") +
+  scale_y_log10()
+```
+
+
+### scatter plot comparing values at different combinations of observation interval and discharge quantile
+```{r}
+load("outputs/output_long_not_exclude_landsat_dates_new_breakPoints.RData", verbose = T)
+
+### calculate scatter plot
+
+output_long = output_long %>% 
+  filter(x_value != 0,
+         y_value != 0) %>% 
+  mutate(x_value = x_value * 0.0283168,
+         y_value = y_value * 0.0283168)
+
+output_long = output_long %>% 
+  mutate(percentile_label = paste0("Quantile: ", as.integer(percentile), "%"))
+
+summary_stats = output_long %>% 
+  group_by(nyear, percentile, percentile_label) %>% 
+  do({
+    top = . 
+    
+    top = top %>% 
+      rename(quantiles_gauge = x_value,
+             quantiles_ls = y_value)
+    # top = merged %>% filter(per == "0")
+    
+    ### linear fit
+    fit = lm(quantiles_ls ~ quantiles_gauge, data = top)
+    b = fit$coefficients[1]
+    k = fit$coefficients[2]
+    fit_string = paste0("y = ", format(k, digits = 2), "x ", if (abs(b) == b) "+ " else "- ", format(abs(b), digits = 2))
+    
+    ### rrmse and rbias
+    error_stats = top %>% 
+      mutate(dif = quantiles_ls - quantiles_gauge) %>% 
+      summarise(rrmse = sqrt(mean((dif / quantiles_gauge)^2)),
+                rbias = mean(dif / quantiles_gauge))
+    
+    rrmse_string = paste0("rRMSE: ", format(error_stats$rrmse, digits = 2))
+    rbias_string = paste0("rBias: ", format(error_stats$rbias, digits = 2))
+    
+    ### ks test
+    ks = ks.test(x = top$quantiles_gauge, y = top$quantiles_ls)
+    D = ks$statistic
+    p = ks$p.value
+    ks_D_string = paste0("K-S D: ", format(D, digits = 2))
+    ks_pvalue_string = if (p < 0.01) "K-S p < 0.01" else paste0("K-S p: ", format(p, digits = 2))
+    
+    ### wilcox
+    wc = wilcox.test(x = top$quantiles_gauge, y = top$quantiles_ls)
+    p = wc$p.value
+    wc_pvalue_string = if (p < 0.01) "Wilcox p < 0.01" else paste0("Wilcox p: ", format(p, digits = 2))
+    
+    tibble(meta1 = paste0(c(fit_string, rrmse_string, rbias_string), collapse = "\n"),
+           meta2 = paste0(c(ks_D_string, ks_pvalue_string, wc_pvalue_string), collapse = "\n"))
+  }) %>% 
+  ungroup() %>% 
+  filter(percentile %in% c("001", "005", "050", "095", "099"),
+         nyear %in% c(1, 2, 3, 5, 10)) %>% 
+  mutate(nyear = factor(paste(sprintf(nyear, fmt = "%02d"), "year(s) of obs"), ordered = T))
+  
+
 selected_percentiles = output_long %>% 
   filter(percentile %in% c("001", "005", "050", "095", "099"),
-         nyear %in% c(1, 2, 5, 8, 10)) %>% 
+         nyear %in% c(1, 2, 3, 5, 10)) %>% 
   mutate(nyear = factor(paste(sprintf(nyear, fmt = "%02d"), "year(s) of obs"), ordered = T)) %>% 
   ggplot() +
     # geom_hex(aes(x = x_value, y = y_value, fill = log(..count..))) +
-    geom_abline(aes(slope = 1, intercept = 0), color = "red") +
-    geom_point(aes(x = x_value, y = y_value), alpha = 0.1, size = 0.1) +
+    geom_abline(aes(slope = 1, intercept = 0), color = "black", lwd = 0.25) +
+    geom_point(aes(x = x_value, y = y_value), alpha = 0.3, size = 1, pch = 1) +
+  geom_smooth(aes(x = x_value, y = y_value), lwd = 0.5, color = "red", method = lm, fullrange = T) +
+  geom_text(data = summary_stats, aes(x = 1e-2, y = 1e6, label = meta1), size = 7 * 0.35, hjust = 0, vjust = 1) +
+    geom_text(data = summary_stats, aes(x = 1e2, y = 1e-2, label = meta2), size = 7 * 0.35, hjust = 0, vjust = 0) +
     scale_fill_viridis_c() +
-    scale_x_log10() +
-    scale_y_log10() +
+    scale_x_log10(limit = c(1e-2, 1e6)) +
+    scale_y_log10(limit = c(1e-2, 1e6)) +
+  coord_equal() +
     labs(
-      x = "Percentile discharge (Gauge sampled; cms)",
-      y = "Percentile discharge (Landsat sampled; cms)"
+      x = "Qpopulation (cms)",
+      y = "Qsample (cms)"
     ) +
-    facet_grid(percentile~nyear)
+    facet_grid(percentile_label~nyear) +
+    theme(panel.background = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"))
 
 selected_percentiles
 
 selected_percentiles %>% 
-  ggsave(filename = "figs/summary_figure/selected_percentile_permu100.png",
+  ggsave(filename = "figs/selected_percentile_permu_new50_stats.png",
          width = 8,
          height = 8,
          dpi = 300)
@@ -415,11 +892,15 @@ selected_percentiles %>%
 ## change point map
 
 ```{r}
-load("outputs/output_long_not_exclude_landsat_dates.RData", verbose = T)
+load("outputs/output_temporal_analysis_not_exclude_landsat_dates.RData", verbose = T)
 
 output %>% select(site_id)
 
 output %>% filter(site_id == "01010000") %>% select(nyear, statistics, site_id)
+
+output %>% filter(site_id == "01042500") %>% 
+  ggplot() +
+  geom_boxplot(aes(x = nyear, y = statistics, group = nyear))
 
 output %>% 
   group_by(site_id) %>% 
@@ -435,11 +916,8 @@ sites_with_10distinct_years = output %>%
   filter(nyear_distinct == 10) %>% 
   select(site_id)
 
-output %>% filter(site_id == "01042500") %>% 
-  ggplot() +
-  geom_boxplot(aes(x = nyear, y = statistics, group = nyear))
-
 ## one example time series for change detection
+require(strucchange)
 test = output %>% filter(site_id == "06652000") %>% group_by(nyear) %>% summarise(D_median = median(statistics)) %>% ungroup()
 
 test_ts = ts(test$D_median, start = 1, end = 10)
@@ -466,12 +944,65 @@ bp_table = output %>%
 
 bp_table %>% filter(bp <= 5) %>% arrange(desc(bp))
 
-
-site_lonlat %>% 
-  left_join(bp_table %>% filter(bp >= 2), by = "site_id") %>% 
+bp_dist = bp_table %>% 
+  mutate(bp = as.factor(bp)) %>% 
   ggplot() +
-  geom_point(aes(x = lon, y = lat, color = bp)) +
-  scale_colour_viridis_c(limits = c(2, 9))
+  geom_bar(aes(x = bp), stat = "count") +
+  labs(
+    x = "Break point (years)",
+    y = "Count"
+  )
+bp_dist
+bp_dist %>% 
+  ggsave(filename = "figs/bp_dist.png",
+         width = 5,
+         height = 4,
+         dpi = 300)
+
+load("outputs/site_lonlat_20191001.RData", verbose = T)
+bp_map = site_lonlat %>% 
+  right_join(bp_table, by = "site_id") %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% 
+  ggplot() +
+  geom_sf(data = st_as_sf(maps::map(database = "world", fill = T, plot = F)), fill = "white", color = "black") +
+  geom_sf(aes(color = bp), alpha = 0.7) +
+  coord_sf(xlim = c(-125, -66), ylim = c(24, 50)) +
+  scale_colour_viridis_c(limits = c(2, 8)) +
+  labs(
+    color = "Break point\nyear"
+  )
+
+bp_map
+bp_map %>% 
+  ggsave(filename = "figs/bp_map.png",
+         width = 7,
+         height = 4,
+         dpi = 300)
+
+
+# output
+set.seed(2019)
+bp_examples = bp_table %>% 
+  group_by(bp) %>% 
+  sample_n(1) %>% 
+  ungroup() %>% 
+  left_join(output, by = "site_id") %>% 
+  ggplot() +
+  geom_vline(aes(xintercept = bp, color = "Break point")) +
+  geom_boxplot(aes(x = nyear, y = statistics, group = nyear)) +
+  facet_wrap(~site_id, scales = "free_y") +
+  scale_x_continuous(breaks = 1:10) +
+  labs(x = "Number of years",
+       y = "D", 
+       color = "")
+
+bp_examples
+
+bp_examples %>% 
+  ggsave(filename = "figs/bp_examples.png",
+         width = 7,
+         height = 6,
+         dpi = 300)
 ```
 
 
