@@ -490,6 +490,284 @@ output = output %>%
   mutate(n_day_miss_per_year = ((nx) - nyear * 365.25) / nyear) # estimate how many days were missing for one year 
   # filter(n_day_miss_per_year >= -30)
 
+## to assign permutation index
+output = output %>% group_by(nyear, site_id) %>% mutate(perm_index = 1:n()) %>% ungroup()
+
+## how many sites included in the analysis
+output %>% 
+  select(site_id) %>% 
+  distinct()
+
+## relationship between median D and nyears
+### 1. for each interval length and for each gauge, calculate the median D values
+### 2. plot the median value against the interval length
+fig_d_nyear = output %>% 
+  # filter(n_day_miss_per_year >= -30) %>% 
+  group_by(nyear, site_id) %>% 
+  summarise(D_median = median(statistics)) %>% 
+  ungroup() %>% 
+  mutate(nyear = as.factor(nyear)) %>% 
+  ggplot() +
+  geom_boxplot(aes(nyear, D_median, group = nyear)) +
+  labs(
+    x = "Landsat observation interval (years)",
+    y = "Median D value"
+  ) +
+  theme(panel.background = element_blank(),
+        panel.border = element_rect(fill = NA, colour = "grey"))
+
+fig_d_nyear
+
+fig_d_nyear %>% 
+  ggsave(filename = "figs/fig_d_nyear_permu50.png",
+         width = 3.74,
+         height = 3.75,
+         dpi = 300)
+
+# output %>% 
+#   group_by(nyear, site_id) %>% 
+#   summarise(p_median = median(pvalue)) %>% 
+#   ungroup() %>% 
+#   mutate(nyear = as.factor(nyear)) %>% 
+#   ggplot() +
+#   geom_boxplot(aes(nyear, p_median, group = nyear)) +
+#   labs(
+#     x = "Years of Landsat observation",
+#     y = "Per site median p value"
+#   )
+
+output_long = output[, c(5:11, 19, 22)] %>% 
+  gather(key = "per", value = "x_value", -c(nyear, perm_index)) %>% 
+  bind_cols(
+    output[, c(12:18)] %>% 
+      gather(key = "y_per", value = "y_value")) %>% 
+  select(-y_per) %>% 
+  separate(per, into = c(NA, "percentile"), sep = "_")
+
+output_long %>% ggplot() +geom_bar(aes(x = perm_index, fill = percentile), position = "dodge")
+
+# save(output_long, file = "outputs/output_long_not_exclude_landsat_dates_new_breakPoints.RData")
+
+load("outputs/output_long_not_exclude_landsat_dates_new_breakPoints.RData", verbose = T)
+
+# pernames = seq(0, 100, by = 10) %>% sprintf(fmt = "%03d")
+# 
+# for (i in 1:length(pernames)) {
+#   
+#   output_long_fil = output_long %>% 
+#     filter(percentile == pernames[i])
+#   
+#   error = output_long_fil %>% 
+#     mutate(diffyx = y_value - x_value) %>% 
+#     group_by(nyear) %>% 
+#     summarise(
+#       `Mean bias` = mean(diffyx),
+#       `Mean absolute error` = mean(abs(diffyx)),
+#       `mRMSE` = sqrt(mean(diffyx^2)) / (max(x_value) - min(x_value))
+#     ) %>% 
+#     ungroup %>% 
+#     gather(key = "metric", value = "value", -nyear)
+#   
+#   error_fig = error %>% 
+#     filter(metric == "mRMSE") %>% 
+#     ggplot() +
+#     geom_line(aes(x = nyear, y = value, color = metric)) +
+#     geom_point(aes(x = nyear, y = value, color = metric)) +
+#     scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+#     labs(
+#       x = "Years of observation",
+#       y = paste0("Error value (", as.integer(pernames[i]), "th percentile)"),
+#       color = "Error metrics"
+#     ) +
+#     theme(legend.position = c(0.8, 0.8))
+#   
+#   error_fig %>% 
+#     ggsave(filename = paste0("figs/summary_figure/", "error_fig_percentile_", pernames[i], ".png"),
+#            width = 5,
+#            height = 5)
+#     
+#   fig = output_long_fil %>% 
+#     mutate(nyear = factor(paste(nyear, "year(s) of obs"), ordered = T)) %>% 
+#     ggplot() +
+#     # geom_hex(aes(x = x_value, y = y_value, fill = log(..count..))) +
+#     geom_abline(aes(slope = 1, intercept = 0), color = "red") +
+#     geom_point(aes(x = x_value, y = y_value), alpha = 0.1, size = 0.1) +
+#     scale_fill_viridis_c() +
+#     scale_x_log10() +
+#     scale_y_log10() +
+#     labs(
+#       x = paste0(as.integer(pernames[i]), "th percentile discharge (Gauge sampled)"),
+#       y = paste0(as.integer(pernames[i]), "th percentile discharge (Landsat sampled)")
+#     ) +
+#     facet_wrap(~nyear, ncol = 4)
+#   
+#   fig %>% 
+#     ggsave(filename = paste0("figs/summary_figure/", "xy_fig_percentile_", pernames[i], ".png"),
+#            width = 10,
+#            height = 7)
+# }
+
+output_long = output_long %>% 
+  mutate(x_value = x_value * 0.0283168,
+         y_value = y_value * 0.0283168)
+
+error_perm = output_long %>% 
+    filter(x_value != 0,
+           y_value != 0) %>% 
+    mutate(diffyx = y_value - x_value) %>% 
+    group_by(nyear, percentile, perm_index) %>% 
+    summarise(
+      Bias = mean(diffyx),
+      rBias = mean(diffyx / x_value, na.rm = T),
+      MAE = mean(abs(diffyx)),
+      rMAE = mean(abs(diffyx / x_value), na.rm = T),
+      RMSE = sqrt(mean((diffyx)^2)),
+      rRMSE = sqrt(mean((diffyx / x_value)^2)),
+      R2 = (lm(y_value ~ x_value) %>% summary)$r.squared
+    ) %>% 
+  ungroup
+
+boxplot_fig = error_perm %>% mutate(nyear = as.factor(nyear)) %>% ggplot() + geom_boxplot(aes(x = nyear, y = R2, fill = percentile)) + labs(x = "Years of observation", y = "R2", fill = "Discharge percentile")
+
+boxplot_fig
+
+boxplot_fig %>% ggsave(filename = "figs/temporal_sampling.png", width = 7, height = 5)
+
+error_perm %>% filter(nyear == 1) %>% ggplot() + geom_point(aes(x = percentile, R2))
+
+error = error_perm %>% 
+  group_by(nyear, percentile) %>% 
+  summarise(Bias = median(Bias),
+            rBias = median(rBias),
+            MAE = median(MAE),
+            rMAE = median(rMAE),
+            RMSE = median(RMSE),
+            rRMSE = median(rRMSE),
+            R2 = median(R2)) %>% 
+  ungroup() %>% 
+  gather(key = "metric", value = "value", -c(nyear, percentile))
+
+abs_error_fig = error %>% 
+  # filter(metric %in% c("rBias", "rMAE", "rRMSE")) %>%
+  filter(metric %in% c("Bias", "MAE", "RMSE")) %>%
+  ggplot(aes(x = nyear, y = value)) +
+  geom_line(aes(color = percentile)) +
+  geom_point(aes(color = percentile)) +
+  # scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+  labs(x = "Years of observation",
+       y = "Discharge (cms)",
+       color = "Discharge\npercentile") +
+  facet_wrap(~metric, scales = "free_y") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "lightgrey"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        axis.title.y = element_blank())
+  
+abs_error_fig
+
+abs_error_fig %>% 
+  ggsave(filename = "figs/relative_error_permu50_fig_absolute_error_corrected.png",
+         width = 6,
+         height = 3,
+         dpi = 300)
+
+rel_error_fig = error %>% 
+  filter(metric %in% c("rBias", "rMAE", "rRMSE")) %>%
+  ggplot(aes(x = nyear, y = value)) +
+  geom_line(aes(color = percentile)) +
+  geom_point(aes(color = percentile)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+  labs(x = "Years of observation",
+       y = "",
+       color = "Discharge\npercentile") +
+  facet_wrap(~metric, scales = "free_y") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "lightgrey"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        axis.title.y = element_blank())
+  
+rel_error_fig
+
+rel_error_fig %>% 
+  ggsave(filename = "figs/relative_error_permu50_fig_relative_error_corrected.png",
+         width = 6,
+         height = 3,
+         dpi = 300)
+
+r2_error_fig = error %>% 
+  # filter(metric %in% c("rBias", "rMAE", "rRMSE")) %>%
+  filter(metric %in% c("R2")) %>%
+  ggplot(aes(x = nyear, y = value)) +
+  geom_line(aes(color = percentile)) +
+  geom_point(aes(color = percentile)) +
+  # scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(1, 10, by = 1)) +
+  labs(x = "Years of observation",
+       y = "",
+       color = "Discharge\npercentile") +
+  facet_wrap(~metric, scales = "free_y") +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "lightgrey"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        axis.title.y = element_blank())
+
+r2_error_fig
+
+r2_error_fig %>% 
+  ggsave(filename = "figs/relative_error_permu50_fig_r2_error_newsize_corrected.png",
+         width = 3.5,
+         height = 4,
+         dpi = 300)
+
+pvalue_boxplot = output %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = nyear, y = pvalue, group = nyear)) +
+  labs(
+    x = "Years of observation",
+    y = "K-S pvalue"
+  ) +
+  theme(panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_line(color = "white"),
+        panel.border = element_rect(fill = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+axis.title.y = element_blank())
+
+pvalue_boxplot
+
+pvalue_boxplot %>% 
+  ggsave(
+    filename = "figs/pvalue_boxplot.png",
+    width = 3,
+    height = 3,
+    dpi = 300
+  )
+```
+
+
+
+### Relationship between comparison and years of observations
+```{r }
+load("outputs/output_temporal_analysis_not_exclude_landsat_dates_permu50_newBreakpoint.RData", verbose = T)
+
+output = output %>% 
+  filter(nyear != -999) %>% 
+  distinct() %>% 
+  mutate(n_day_miss_per_year = ((nx) - nyear * 365.25) / nyear) # estimate how many days were missing for one year 
+  # filter(n_day_miss_per_year >= -30)
+
 ## how many sites included in the analysis
 output %>% 
   select(site_id) %>% 
